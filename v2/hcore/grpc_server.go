@@ -106,7 +106,7 @@ func Setup(params *SetupRequest, platformInterface libbox.PlatformInterface) err
 		statusPropagationPort = int64(params.FlutterStatusPort)
 	// case SetupMode_GRPC_BACKGROUND_INSECURE:
 	default:
-		_, err := StartGrpcServerByMode(params.Listen, params.Mode)
+		_, err := StartGrpcServerByModeWithSecret(params.Listen, params.Mode, params.Secret)
 		if err != nil {
 			return err
 		}
@@ -177,6 +177,12 @@ var (
 
 // StartGrpcServerByMode starts a gRPC server on the specified address with mTLS.
 func StartGrpcServerByMode(listenAddressG string, mode SetupMode) (*grpc.Server, error) {
+	return StartGrpcServerByModeWithSecret(listenAddressG, mode, "")
+}
+
+// StartGrpcServerByModeWithSecret is StartGrpcServerByMode plus Muse token auth
+// for the INSECURE modes when secret is non-empty (see grpc_auth.go).
+func StartGrpcServerByModeWithSecret(listenAddressG string, mode SetupMode, secret string) (*grpc.Server, error) {
 	// Validate the listen address
 	if !strings.Contains(listenAddressG, ":") {
 		return nil, fmt.Errorf("invalid listen address (no port): %s", listenAddressG)
@@ -197,7 +203,7 @@ func StartGrpcServerByMode(listenAddressG string, mode SetupMode) (*grpc.Server,
 	}
 
 	if mode == SetupMode_GRPC_BACKGROUND_INSECURE || mode == SetupMode_GRPC_NORMAL_INSECURE {
-		grpcServer[mode] = grpc.NewServer()
+		grpcServer[mode] = grpc.NewServer(grpcTokenServerOptions(secret)...)
 	} else {
 		table := db.GetTable[hcommon.AppSettings]()
 		Log(LogLevel_DEBUG, LogType_CORE, table)
