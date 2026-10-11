@@ -1,0 +1,73 @@
+name: Muse Core Android
+
+# Muse VPN core (fork of hiddify-core, GPLv3).
+# Builds the Android AAR the Muse VPN app downloads in `make android-libs`.
+# Push to muse -> artifact. Tag v*-muse* -> GitHub Release with hiddify-lib-android.tar.gz.
+on:
+  push:
+    branches: [muse]
+    tags: ['v*-muse*']
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Submodules (ssh urls -> https)
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+
+      - name: Build AAR
+        run: make android
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CODE_VERSION: "-X github.com/hiddify/hiddify-core/v2/hcommon/constants.Version=${{ github.ref_name }}"
+
+      - name: Package
+        working-directory: bin
+        run: |
+          ls -la
+          tar -czvf hiddify-lib-android.tar.gz ./hiddify-core.aar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hiddify-lib-android
+          path: bin/hiddify-lib-android.tar.gz
+          retention-days: 14
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bin/hiddify-lib-android.tar.gz
+          prerelease: true
