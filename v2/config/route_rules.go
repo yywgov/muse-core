@@ -144,6 +144,48 @@ func (b *appRouteRules) add(rule *Rule) {
 	})
 
 	b.addDNSRule(rule, raw, dnsRuleSets)
+	b.addGeoIPDNSRule(rule, raw, ruleSets)
+}
+
+// addGeoIPDNSRule (Muse/穿云): a direct rule's geoip rule-sets also steer DNS. A name no earlier rule
+// matched is first resolved with the direct DNS, and that answer is kept only when its addresses are
+// in those rule-sets (e.g. geoip-cn); otherwise the rule is skipped and a later one (in the end the
+// remote DNS) answers. Unlisted domestic sites so get their nearby servers and then go direct through
+// the geoip route rule, instead of being resolved abroad and sent through the proxy.
+func (b *appRouteRules) addGeoIPDNSRule(rule *Rule, raw option.RawDefaultRule, ruleSets []string) {
+	if b.fakeDNS {
+		return
+	}
+	if rule.GetOutbound() != Outbound_direct && rule.GetOutbound() != Outbound_direct_with_fragment {
+		return
+	}
+	if len(raw.Network)+len(raw.Protocol)+len(raw.Port)+len(raw.PortRange)+len(raw.SourcePort)+
+		len(raw.SourcePortRange)+len(raw.SourceIPCIDR)+len(raw.ProcessName)+len(raw.ProcessPath)+
+		len(raw.PackageName) > 0 {
+		return
+	}
+	var geoip []string
+	for _, tag := range ruleSets {
+		if strings.HasPrefix(tag, "geoip-") {
+			geoip = append(geoip, tag)
+		}
+	}
+	if len(geoip) == 0 {
+		return
+	}
+	b.dnsRules = append(b.dnsRules, option.DefaultDNSRule{
+		RawDefaultDNSRule: option.RawDefaultDNSRule{RuleSet: geoip},
+		DNSRuleAction: option.DNSRuleAction{
+			Action: C.RuleActionTypeRoute,
+			RouteOptions: option.DNSRouteActionOptions{
+				Server: DNSMultiDirectTag,
+				AbstractDNSRouteActionOptions: option.AbstractDNSRouteActionOptions{
+					Strategy:   b.strategy,
+					RewriteTTL: &DEFAULT_DNS_TTL,
+				},
+			},
+		},
+	})
 }
 
 // addDNSRule resolves the names a rule sends direct with the direct DNS (and refuses the ones it

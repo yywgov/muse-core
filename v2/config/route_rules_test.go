@@ -82,21 +82,27 @@ func TestAppRouteRules(t *testing.T) {
 	if got := strings.Join(ruleSetTags(options), ","); got != "geosite-ir,geoip-ir" {
 		t.Fatalf("rule-sets: %s", got)
 	}
-	// the region's names resolve with the direct DNS, but not with the IP-only rule-set
-	foundDNS := false
+	// the region's names resolve with the direct DNS; the IP rule-set gets its own rule, an address
+	// filter on the direct DNS answer (kept only when the answer is in the region)
+	foundDNS, foundGeoIP := false, false
 	for _, rule := range options.DNS.Rules {
-		rs := rule.DefaultOptions.RuleSet
-		if strings.Join(rs, ",") == "geosite-ir" {
+		rs := strings.Join(rule.DefaultOptions.RuleSet, ",")
+		switch rs {
+		case "geosite-ir":
 			foundDNS = rule.DefaultOptions.RouteOptions.Server == DNSMultiDirectTag
-		}
-		for _, tag := range rs {
-			if strings.HasPrefix(tag, "geoip-") {
-				t.Fatalf("a DNS rule uses the IP rule-set %s", tag)
+		case "geoip-ir":
+			foundGeoIP = rule.DefaultOptions.RouteOptions.Server == DNSMultiDirectTag
+		default:
+			if strings.Contains(rs, "geoip-") {
+				t.Fatalf("a DNS rule mixes the IP rule-set in: %s", rs)
 			}
 		}
 	}
 	if !foundDNS {
 		t.Fatal("no direct DNS rule for the region")
+	}
+	if !foundGeoIP {
+		t.Fatal("no geoip address-filter DNS rule for the region")
 	}
 }
 
