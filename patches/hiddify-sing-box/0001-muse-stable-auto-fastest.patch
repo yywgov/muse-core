@@ -1,0 +1,141 @@
+diff --git a/common/monitoring/outbound_monitoring.go b/common/monitoring/outbound_monitoring.go
+index 814aabe..0f5ba9c 100644
+--- a/common/monitoring/outbound_monitoring.go
++++ b/common/monitoring/outbound_monitoring.go
+@@ -578,6 +578,26 @@ func (m *OutboundMonitoring) tester(parent context.Context, tag string) (adapter
+ 	defer cancel()
+ 
+ 	delay, err := urltest.URLTest(ctx, m.urls[idx], out.outbound)
++	// muse: the first test of a session (no samples yet) also warms the connection up:
++	// two more probes follow and the median of the three is kept, so the first number
++	// shown is already stable instead of a cold-start outlier.
++	out.mu.Lock()
++	firstTest := len(out.samples) == 0
++	out.mu.Unlock()
++	if err == nil && delay < TimeoutDelay && firstTest {
++		probes := []uint16{delay}
++		for i := 0; i < 2; i++ {
++			if ctx.Err() != nil {
++				break
++			}
++			d, e := urltest.URLTest(ctx, m.urls[idx], out.outbound)
++			if e != nil || d >= TimeoutDelay {
++				break
++			}
++			probes = append(probes, d)
++		}
++		delay = medianDelay(probes)
++	}
+ 
+ 	his := adapter.URLTestHistory{
+ 		Time:  time.Now(),
+@@ -757,6 +777,16 @@ func (m *OutboundMonitoring) applyResult(outcome testOutcome) *adapter.URLTestHi
+ 	if (outcome.history.Delay != state.history.Delay) || state.history.IpInfo == nil || (outcome.history.IpInfo != nil) {
+ 		m.cacheDirty.Store(true)
+ 	}
++	if outcome.err == nil && outcome.history.Delay > 0 && outcome.history.Delay < TimeoutDelay {
++		state.samples = append(state.samples, outcome.history.Delay)
++		if len(state.samples) > 3 {
++			state.samples = state.samples[len(state.samples)-3:]
++		}
++		outcome.history.Delay = medianDelay(state.samples)
++	} else {
++		// a failure counts at once: the node is reported as timed out
++		state.samples = state.samples[:0]
++	}
+ 	state.history.Delay = outcome.history.Delay
+ 	state.history.Time = outcome.history.Time
+ 	state.from_cache = false
+@@ -801,7 +831,9 @@ func (m *OutboundMonitoring) collectCycleTargets() []string {
+ 			state.mu.Unlock()
+ 			continue
+ 		}
+-		if state.invalid || time.Since(state.history.Time) >= m.mainInterval {
++		// muse: results loaded from the cache are re-tested right away, so a new
++		// session never keeps another session's numbers
++		if state.invalid || state.from_cache || time.Since(state.history.Time) >= m.mainInterval {
+ 			tags = append(tags, tag)
+ 			delays[tag] = state.history.Delay
+ 		}
+@@ -964,6 +996,9 @@ type outboundState struct {
+ 	enqueuedCycle  uint64
+ 	from_cache     bool
+ 
++	// muse: recent successful delays; the reported delay is their median
++	samples []uint16
++
+ 	history adapter.URLTestHistory
+ }
+ 
+@@ -1041,3 +1076,13 @@ func (m *OutboundMonitoring) loadHistory() *History {
+ 	}
+ 	return history
+ }
++
++// muse: median of the given delays (the upper middle for an even count).
++func medianDelay(values []uint16) uint16 {
++	if len(values) == 0 {
++		return 0
++	}
++	sorted := append([]uint16(nil), values...)
++	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
++	return sorted[len(sorted)/2]
++}
+diff --git a/protocol/group/balancer/lowest_delay.go b/protocol/group/balancer/lowest_delay.go
+index 1ed6f61..2d2dbb2 100644
+--- a/protocol/group/balancer/lowest_delay.go
++++ b/protocol/group/balancer/lowest_delay.go
+@@ -4,11 +4,13 @@ import (
+ 	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/monitoring"
+ 	"github.com/sagernet/sing-box/option"
+ 	N "github.com/sagernet/sing/common/network"
+ )
+ 
+ type LowestDelay struct {
++	tolerance        uint16
+ 	outbounds        map[string][]adapter.Outbound
+ 	udpOutbounds     []adapter.Outbound
+ 	selectedOutbound map[string]adapter.Outbound
+@@ -19,6 +21,7 @@ type LowestDelay struct {
+ func NewLowestDelay(outbounds []adapter.Outbound, options option.BalancerOutboundOptions) *LowestDelay {
+ 	couts := convertOutbounds(outbounds)
+ 	return &LowestDelay{
++		tolerance: options.Tolerance,
+ 		outbounds: couts,
+ 		selectedOutbound: map[string]adapter.Outbound{
+ 			N.NetworkUDP: couts[N.NetworkUDP][0],
+@@ -36,9 +39,30 @@ func (s *LowestDelay) Now() string {
+ 	return s.selectedOutbound[N.NetworkTCP].Tag()
+ }
+ func (s *LowestDelay) UpdateOutboundsInfo(history map[string]*adapter.URLTestHistory) bool {
+-	min, _ := getMinDelay(s.outbounds, history)
++	min, minDelays := getMinDelay(s.outbounds, history)
+ 
+ 	s.mu.Lock()
++	// muse: tolerance — keep the current pick unless the new best is clearly faster
++	// (more than max(tolerance, 15%)), so the group does not flap between nodes whose
++	// latencies differ only by noise.
++	for net, out := range min {
++		current := s.selectedOutbound[net]
++		if current == nil || out == nil || current.Tag() == out.Tag() {
++			continue
++		}
++		currentDelay := getTagDelay(current.Tag(), history)
++		if currentDelay >= monitoring.TimeoutDelay {
++			continue
++		}
++		best := minDelays[net]
++		margin := uint32(s.tolerance)
++		if pct := uint32(best) * 15 / 100; pct > margin {
++			margin = pct
++		}
++		if uint32(currentDelay) <= uint32(best)+margin {
++			min[net] = current
++		}
++	}
+ 	changed := false
+ 	for net, out := range min {
+ 		changed = changed || out.Tag() != s.selectedOutbound[net].Tag()

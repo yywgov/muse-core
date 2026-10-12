@@ -31,6 +31,13 @@ jobs:
           git submodule sync --recursive
           git submodule update --init --recursive
 
+      - name: Apply Muse patches to hiddify-sing-box
+        run: |
+          for p in patches/hiddify-sing-box/*.patch; do
+            echo "applying $p"
+            git -C hiddify-sing-box apply --verbose "../$p"
+          done
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod

@@ -244,13 +244,12 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 			Outbounds:            tags,
 			Strategy:             "lowest-delay",
 			DelayAcceptableRatio: 2,
-			// URL:       opt.ConnectionTestUrl,
-			// URLs:      opt.ConnectionTestUrls,
-			// Interval:  badoption.Duration(opt.URLTestInterval.Duration()),
-			// IdleTimeout: badoption.Duration(opt.URLTestIdleTimeout.Duration()),
-			Tolerance: 1,
-			// IdleTimeout:               badoption.Duration(opt.URLTestInterval.Duration().Nanoseconds() * 3),
-			InterruptExistConnections: true,
+			// muse: stay on the current node unless another is clearly faster
+			// (max(50 ms, 15%), see patches/hiddify-sing-box), so it does not flap
+			Tolerance: 50,
+			// muse: a better node is used for new connections only; interrupting the
+			// existing ones dropped every open connection each time the pick changed
+			InterruptExistConnections: false,
 		},
 	}
 
@@ -261,13 +260,9 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 			Outbounds:            tags,
 			Strategy:             opt.BalancerStrategy,
 			DelayAcceptableRatio: 2,
-			// URL:       opt.ConnectionTestUrl,
-			// URLs:      opt.ConnectionTestUrls,
-			// Interval:  badoption.Duration(opt.URLTestInterval.Duration()),
-			// IdleTimeout: badoption.Duration(opt.URLTestIdleTimeout.Duration()),
-			Tolerance: 1,
-			// IdleTimeout:               badoption.Duration(opt.URLTestInterval.Duration().Nanoseconds() * 3),
-			InterruptExistConnections: true,
+			Tolerance:            1,
+			// muse: never cut open connections when the set of acceptable nodes changes
+			InterruptExistConnections: false,
 		},
 	}
 	if len(tags) == 0 {
@@ -285,7 +280,8 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 	if len(tags) > 1 {
 		outbounds = append([]option.Outbound{balancer, urlTest}, outbounds...)
 		selectorTags = append([]string{urlTest.Tag, balancer.Tag}, selectorTags...)
-		defaultSelect = balancer.Tag
+		// muse: 自动最快 (lowest delay) is the default, not 负载均衡
+		defaultSelect = urlTest.Tag
 	}
 	selector := option.Outbound{
 		Type: C.TypeSelector,

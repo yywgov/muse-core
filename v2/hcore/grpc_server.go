@@ -54,9 +54,15 @@ func Setup(params *SetupRequest, platformInterface libbox.PlatformInterface) err
 		Log(LogLevel_WARNING, LogType_CORE, "grpcServer already started")
 		return nil
 	}
-	static.BaseContext = libbox.BaseContext(platformInterface)
+	// muse: the app's own gRPC server is set up without a platform interface, in the same
+	// process as the VPN service. Setting it up again (e.g. when the app returns to the
+	// foreground) must not drop the VPN service's interface, or a later restart/hot reload
+	// builds outbounds without it.
+	if platformInterface != nil || static.globalPlatformInterface == nil {
+		static.BaseContext = libbox.BaseContext(platformInterface)
+		static.globalPlatformInterface = platformInterface
+	}
 	static.debug = params.Debug
-	static.globalPlatformInterface = platformInterface
 	tcpConn := true // runtime.GOOS == "windows" // TODO add TVOS
 	libbox.Setup(
 		&libbox.SetupOptions{
