@@ -1,8 +1,10 @@
-name: Muse Core Android
+name: Muse Core
 
-# Muse VPN core (fork of hiddify-core, GPLv3).
-# Builds the Android AAR the Muse VPN app downloads in `make android-libs`.
-# Push to muse -> artifact. Tag v*-muse* -> GitHub Release with hiddify-lib-android.tar.gz.
+# 穿云 core (fork of hiddify-core, GPLv3).
+# Builds the Android AAR (`make android-libs` in the app) and the Windows x64 library
+# (`make windows-libs`: hiddify-core.dll + libcronet.dll + HiddifyCli.exe, like upstream).
+# Push to muse -> artifacts. Tag v*-muse* -> one GitHub Release with
+# hiddify-lib-android.tar.gz and hiddify-lib-windows-amd64.tar.gz.
 on:
   push:
     branches: [muse]
@@ -72,9 +74,76 @@ jobs:
           path: bin/hiddify-lib-android.tar.gz
           retention-days: 14
 
+  windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Submodules (ssh urls -> https)
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Apply Muse patches to hiddify-sing-box
+        run: |
+          for p in patches/hiddify-sing-box/*.patch; do
+            echo "applying $p"
+            git -C hiddify-sing-box apply --verbose "../$p"
+          done
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: false
+
+      # same toolchain as upstream build.yml (hiddify-lib-windows-amd64)
+      - name: Setup MinGW
+        uses: egor-tensin/setup-mingw@v2
+        with:
+          platform: x64
+
+      - name: Build Windows library + CLI
+        run: make windows-amd64
+        env:
+          CODE_VERSION: "-X github.com/hiddify/hiddify-core/v2/hcommon/constants.Version=${{ github.ref_name }}"
+
+      - name: Package
+        working-directory: bin
+        run: |
+          ls -la
+          for f in hiddify-core.dll libcronet.dll HiddifyCli.exe; do
+            test -f "$f" || { echo "missing $f"; exit 1; }
+          done
+          tar -czvf hiddify-lib-windows-amd64.tar.gz ./hiddify-core.dll ./libcronet.dll ./HiddifyCli.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hiddify-lib-windows-amd64
+          path: bin/hiddify-lib-windows-amd64.tar.gz
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - run: ls -la dist
+
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: bin/hiddify-lib-android.tar.gz
+          files: |
+            dist/hiddify-lib-android.tar.gz
+            dist/hiddify-lib-windows-amd64.tar.gz
           prerelease: true
