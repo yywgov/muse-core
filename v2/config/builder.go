@@ -18,6 +18,7 @@ import (
 	sdns "github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
+	N "github.com/sagernet/sing/common/network"
 )
 
 const (
@@ -642,6 +643,11 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 	useAppRules := hopt.RouteRule != nil && hopt.RouteRule.RouteRule != nil
 	if useAppRules {
 		routeRules = append(routeRules, appRules.routeRules...)
+		// muse (穿云): QUIC that would go through the proxy is refused, after the rules that send
+		// traffic direct (domestic QUIC keeps working). Over a TCP-based node, QUIC (UDP 443)
+		// stalls or crawls; refused, apps and browsers fall back to HTTP/2 over TCP at once,
+		// which is what made images load slowly through the proxy.
+		routeRules = append(routeRules, rejectProxiedQUICRule())
 	}
 	if !useAppRules && hopt.BypassLAN {
 		routeRules = append(
@@ -1207,4 +1213,22 @@ func generateRandomString(length int) string {
 
 	// Trim padding characters and return the string
 	return randomString[:length]
+}
+
+// rejectProxiedQUICRule (muse): placed after the direct rules, so only QUIC that would reach the
+// proxy (the final outbound) is refused; the ICMP unreachable makes clients retry over TCP at once.
+func rejectProxiedQUICRule() option.Rule {
+	return option.Rule{
+		Type: C.RuleTypeDefault,
+		DefaultOptions: option.DefaultRule{
+			RawDefaultRule: option.RawDefaultRule{
+				Network:  badoption.Listable[string]{N.NetworkUDP},
+				Protocol: badoption.Listable[string]{C.ProtocolQUIC},
+			},
+			RuleAction: option.RuleAction{
+				Action:        C.RuleActionTypeReject,
+				RejectOptions: option.RejectActionOptions{Method: C.RuleActionRejectMethodDefault},
+			},
+		},
+	}
 }

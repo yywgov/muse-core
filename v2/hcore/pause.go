@@ -5,6 +5,7 @@ import (
 	"time"
 
 	hcommon "github.com/hiddify/hiddify-core/v2/hcommon"
+	"github.com/sagernet/sing-box/common/monitoring"
 	C "github.com/sagernet/sing-box/constant"
 )
 
@@ -46,4 +47,10 @@ func Wake() {
 		}
 	}
 
+}
+
+// SetScreenOn (muse/穿云): while the screen is off node tests run every 15 minutes; when it
+// comes back on every node is tested again at once (see patches/hiddify-sing-box 0002).
+func SetScreenOn(on bool) {
+	monitoring.SetScreenOn(on)
 }

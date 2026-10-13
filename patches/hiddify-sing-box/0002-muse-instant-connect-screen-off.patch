@@ -1,0 +1,254 @@
+diff --git a/common/monitoring/muse_screen.go b/common/monitoring/muse_screen.go
+new file mode 100644
+index 00000000..0f842458
+--- /dev/null
++++ b/common/monitoring/muse_screen.go
+@@ -0,0 +1,65 @@
++package monitoring
++
++// muse (穿云): node tests follow the phone's screen. While the screen is off the regular test
++// cycle runs at most every ScreenOffInterval (saves battery and data on a sleeping phone);
++// when the screen comes back on every node is tested again at once, so the numbers and the
++// 自动最快 pick are fresh by the time the user looks.
++
++import (
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++const ScreenOffInterval = 15 * time.Minute
++
++var (
++	museScreenOff atomic.Bool
++	museMonitors  sync.Map // *OutboundMonitoring -> struct{}
++)
++
++// SetScreenOn is called by the platform when the screen turns on or off.
++func SetScreenOn(on bool) {
++	if !on {
++		museScreenOff.Store(true)
++		return
++	}
++	if !museScreenOff.Swap(false) {
++		return
++	}
++	museMonitors.Range(func(key, _ any) bool {
++		key.(*OutboundMonitoring).museRetestNow()
++		return true
++	})
++}
++
++// ScreenOff reports whether the platform said the screen is off.
++func ScreenOff() bool {
++	return museScreenOff.Load()
++}
++
++func museRegister(m *OutboundMonitoring) {
++	museMonitors.Store(m, struct{}{})
++}
++
++func museUnregister(m *OutboundMonitoring) {
++	museMonitors.Delete(m)
++}
++
++// museSkipCycle: a regular cycle is skipped while the screen is off and the last one is recent.
++func museSkipCycle(m *OutboundMonitoring) bool {
++	if !museScreenOff.Load() {
++		return false
++	}
++	last := m.lastCycle.Load()
++	return !last.IsZero() && time.Since(last) < ScreenOffInterval
++}
++
++func (m *OutboundMonitoring) museRetestNow() {
++	if !m.started || m.ctx.Err() != nil {
++		return
++	}
++	m.forceAll.Store(true)
++	m.Touch()
++	m.startCycleOnce()
++}
+diff --git a/common/monitoring/muse_screen_test.go b/common/monitoring/muse_screen_test.go
+new file mode 100644
+index 00000000..4b59c982
+--- /dev/null
++++ b/common/monitoring/muse_screen_test.go
+@@ -0,0 +1,30 @@
++package monitoring
++
++import (
++	"testing"
++	"time"
++)
++
++func TestMuseScreenOffSkipsCycles(t *testing.T) {
++	m := &OutboundMonitoring{}
++	SetScreenOn(true)
++	if museSkipCycle(m) {
++		t.Fatal("screen on must never skip")
++	}
++	SetScreenOn(false)
++	if museSkipCycle(m) {
++		t.Fatal("no cycle yet: must run")
++	}
++	m.lastCycle.Store(time.Now().Add(-5 * time.Minute))
++	if !museSkipCycle(m) {
++		t.Fatal("screen off, 5 min since last cycle: must skip")
++	}
++	m.lastCycle.Store(time.Now().Add(-16 * time.Minute))
++	if museSkipCycle(m) {
++		t.Fatal("screen off, 16 min since last cycle: must run")
++	}
++	SetScreenOn(true) // m is not registered/started: nothing to retest
++	if ScreenOff() {
++		t.Fatal("screen should be on")
++	}
++}
+diff --git a/common/monitoring/outbound_monitoring.go b/common/monitoring/outbound_monitoring.go
+index 0f5ba9c7..a36ab985 100644
+--- a/common/monitoring/outbound_monitoring.go
++++ b/common/monitoring/outbound_monitoring.go
+@@ -88,6 +88,10 @@ type OutboundMonitoring struct {
+ 
+ 	cacheDirty atomic.Bool
+ 
++	// muse: screen on/off handling (see muse_screen.go)
++	forceAll  atomic.Bool
++	lastCycle common.TypedValue[time.Time]
++
+ 	cycleSeq     uint64
+ 	cycleRunning atomic.Bool
+ 
+@@ -296,6 +300,7 @@ func (m *OutboundMonitoring) Start(stage adapter.StartStage) error {
+ 		}
+ 
+ 		m.started = true
++		museRegister(m)
+ 		m.Touch()
+ 	}
+ 
+@@ -437,6 +442,7 @@ func (m *OutboundMonitoring) UnsubscribeGroup(groupTag string, observer <-chan G
+ 
+ func (m *OutboundMonitoring) Close() error {
+ 	m.closerOnce.Do(func() {
++		museUnregister(m)
+ 		m.stopTimerWorkers()
+ 
+ 		// close(m.priorityQueue)
+@@ -468,6 +474,10 @@ func (m *OutboundMonitoring) scheduleLoop(ticker *time.Ticker) {
+ 				m.stopTimerWorkers()
+ 				return
+ 			}
++			// muse: while the screen is off, test at most every ScreenOffInterval
++			if museSkipCycle(m) {
++				continue
++			}
+ 			m.startCycleOnce()
+ 		}
+ 	}
+@@ -648,6 +658,7 @@ func (m *OutboundMonitoring) startCycleOnce() bool {
+ 
+ func (m *OutboundMonitoring) runCycle() {
+ 	cycleID := atomic.AddUint64(&m.cycleSeq, 1)
++	m.lastCycle.Store(time.Now())
+ 	tags := m.collectCycleTargets()
+ 
+ 	if len(tags) == 0 {
+@@ -821,6 +832,8 @@ func (m *OutboundMonitoring) collectCycleTargets() []string {
+ 	tags := make([]string, 0, len(m.reg().outbounds))
+ 
+ 	delays := make(map[string]uint16, len(tags))
++	// muse: right after the screen comes back on every node is tested again
++	force := m.forceAll.Swap(false)
+ 
+ 	for tag, state := range m.reg().outbounds {
+ 		if _, ok := m.reg().groups[tag]; ok {
+@@ -833,7 +846,7 @@ func (m *OutboundMonitoring) collectCycleTargets() []string {
+ 		}
+ 		// muse: results loaded from the cache are re-tested right away, so a new
+ 		// session never keeps another session's numbers
+-		if state.invalid || state.from_cache || time.Since(state.history.Time) >= m.mainInterval {
++		if force || state.invalid || state.from_cache || time.Since(state.history.Time) >= m.mainInterval {
+ 			tags = append(tags, tag)
+ 			delays[tag] = state.history.Delay
+ 		}
+diff --git a/protocol/group/balancer/balancer.go b/protocol/group/balancer/balancer.go
+index fee64339..ed102ce3 100644
+--- a/protocol/group/balancer/balancer.go
++++ b/protocol/group/balancer/balancer.go
+@@ -129,6 +129,16 @@ func (s *Balancer) worker() {
+ 	}
+ 	defer s.monitor.UnsubscribeGroup(s.Tag(), observer)
+ 
++	// muse (穿云 秒连): start on the node that was fastest last time (results kept in the cache
++	// file) instead of the first node, until this session's own tests come in. Nothing is
++	// interrupted: this runs before the first connection is made through the group.
++	if _, ok := s.strategyFn.(*LowestDelay); ok {
++		history := s.monitor.OutboundsHistory(s.Tag())
++		if hasUsableDelay(history) {
++			s.strategyFn.UpdateOutboundsInfo(history)
++		}
++	}
++
+ 	for {
+ 		select {
+ 		case <-s.close:
+@@ -266,3 +276,13 @@ func (s *Balancer) PreMatchFlow(network string, destination netip.Addr) adapter.
+ 	}
+ 	return adapter.PreMatchContinue
+ }
++
++// muse: whether any node has a real (non-timeout) delay, e.g. one kept from the last session.
++func hasUsableDelay(history map[string]*adapter.URLTestHistory) bool {
++	for _, his := range history {
++		if his != nil && his.Delay > 0 && his.Delay < monitoring.TimeoutDelay {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/protocol/group/balancer/muse_seed_test.go b/protocol/group/balancer/muse_seed_test.go
+new file mode 100644
+index 00000000..2bb6ba22
+--- /dev/null
++++ b/protocol/group/balancer/muse_seed_test.go
+@@ -0,0 +1,38 @@
++package balancer
++
++import (
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/monitoring"
++	"github.com/sagernet/sing-box/option"
++	"github.com/stretchr/testify/require"
++)
++
++// muse 秒连: cached results (from the last session) pick the start node; no data keeps the first.
++func TestMuseSeedFromCache(t *testing.T) {
++	a, b, c := newFake("a"), newFake("b"), newFake("c")
++	ld := NewLowestDelay([]adapter.Outbound{a, b, c}, option.BalancerOutboundOptions{Tolerance: 50})
++	require.Equal(t, "a", ld.Now())
++
++	empty := map[string]*adapter.URLTestHistory{"a": {}, "b": {}, "c": {}}
++	require.False(t, hasUsableDelay(empty))
++
++	cached := map[string]*adapter.URLTestHistory{
++		"a": {Delay: 0, IsFromCache: true},
++		"b": {Delay: 300, IsFromCache: true},
++		"c": {Delay: 120, IsFromCache: true},
++	}
++	require.True(t, hasUsableDelay(cached))
++	ld.UpdateOutboundsInfo(cached)
++	require.Equal(t, "c", ld.Now())
++
++	// this session's first real result for c keeps it; an untested b stays behind (cache penalty)
++	fresh := map[string]*adapter.URLTestHistory{
++		"a": {Delay: monitoring.TimeoutDelay},
++		"b": {Delay: 300, IsFromCache: true},
++		"c": {Delay: 150},
++	}
++	ld.UpdateOutboundsInfo(fresh)
++	require.Equal(t, "c", ld.Now())
++}

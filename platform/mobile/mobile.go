@@ -80,3 +80,12 @@ func Pause() {
 func Wake() {
 	hcore.Wake()
 }
+
+// ScreenOn / ScreenOff (muse/穿云): called by the Android service on screen changes.
+func ScreenOn() {
+	hcore.SetScreenOn(true)
+}
+
+func ScreenOff() {
+	hcore.SetScreenOn(false)
+}
