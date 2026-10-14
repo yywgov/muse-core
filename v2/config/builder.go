@@ -350,31 +350,32 @@ func setExperimental(options *option.Options, hopt *HiddifyOptions) {
 			hopt.ConnectionTestUrls = []string{hopt.ConnectionTestUrl}
 		}
 	}
+	// muse: the cache file (remote rule-sets, selected nodes, url-test results) and the url-test
+	// monitor are always on, not only with the clash API: connecting then reuses the cached
+	// rule-sets instead of downloading them again, and works offline from the cache.
+	options.Experimental = &option.ExperimentalOptions{
+		UnifiedDelay: &option.UnifiedDelayOptions{
+			Enabled: true,
+		},
+		CacheFile: &option.CacheFileOptions{
+			Enabled:         true,
+			StoreWARPConfig: true,
+			Path:            "data/clash.db",
+		},
+		Monitoring: &option.MonitoringOptions{
+			URLs:           hopt.ConnectionTestUrls,
+			Interval:       badoption.Duration(hopt.URLTestInterval.Duration()),
+			DebounceWindow: badoption.Duration(time.Millisecond * 500),
+			IdleTimeout:    badoption.Duration(hopt.URLTestInterval.Duration().Nanoseconds() * 3),
+		},
+	}
 	if hopt.EnableClashApi {
 		if hopt.ClashApiSecret == "" {
 			hopt.ClashApiSecret = defaultClashApiSecret()
 		}
-		options.Experimental = &option.ExperimentalOptions{
-			UnifiedDelay: &option.UnifiedDelayOptions{
-				Enabled: true,
-			},
-			ClashAPI: &option.ClashAPIOptions{
-				ExternalController: fmt.Sprintf("%s:%d", "127.0.0.1", hopt.ClashApiPort),
-				Secret:             hopt.ClashApiSecret,
-			},
-
-			CacheFile: &option.CacheFileOptions{
-				Enabled:         true,
-				StoreWARPConfig: true,
-				Path:            "data/clash.db",
-			},
-
-			Monitoring: &option.MonitoringOptions{
-				URLs:           hopt.ConnectionTestUrls,
-				Interval:       badoption.Duration(hopt.URLTestInterval.Duration()),
-				DebounceWindow: badoption.Duration(time.Millisecond * 500),
-				IdleTimeout:    badoption.Duration(hopt.URLTestInterval.Duration().Nanoseconds() * 3),
-			},
+		options.Experimental.ClashAPI = &option.ClashAPIOptions{
+			ExternalController: fmt.Sprintf("%s:%d", "127.0.0.1", hopt.ClashApiPort),
+			Secret:             hopt.ClashApiSecret,
 		}
 	}
 }

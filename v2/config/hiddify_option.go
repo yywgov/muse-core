@@ -31,6 +31,9 @@ type HiddifyOptions struct {
 	Mux       MuxOptions        `json:"mux,omitempty" overridable:"true"`
 	TLSTricks TLSTricks         `json:"tls-tricks,omitempty"`
 	EnableNTP bool              `json:"enable-ntp,omitempty"`
+	// muse: 「我的宽带」 for Hysteria2 outbounds, Mbps; 0 = keep BBR (not overridable by subscriptions)
+	Hysteria2UpMbps   int `json:"hysteria2-up-mbps,omitempty"`
+	Hysteria2DownMbps int `json:"hysteria2-down-mbps,omitempty"`
 
 	DNSOptions
 	InboundOptions

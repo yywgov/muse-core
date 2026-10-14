@@ -36,10 +36,7 @@ func (h *HiddifyInstance) readStatus(prev *SystemInfo) *SystemInfo {
 		message.ConnectionsIn = status.ConnectionsIn
 		message.ConnectionsOut = status.ConnectionsOut
 
-		if prev != nil {
-			message.Uplink = message.UplinkTotal - prev.UplinkTotal
-			message.Downlink = message.DownlinkTotal - prev.DownlinkTotal
-		}
+		message.Uplink, message.Downlink = speedSince(prev, message.UplinkTotal, message.DownlinkTotal)
 		if box := h.Box(); box != nil {
 			current := ""
 			if currentOutBound, ok := box.Outbound().Outbound(config.OutboundSelectTag); ok {
@@ -98,38 +95,28 @@ func (h *HiddifyInstance) MakeSureContextIsNew(streamContext context.Context) {
 	}
 }
 func (h *HiddifyInstance) GetSystemInfo(stream grpc.ServerStreamingServer[SystemInfo]) error {
-	// return fmt.Errorf("not implemented yet")
-	h.MakeSureContextIsNew(stream.Context())
-
+	// muse: the stream follows the core across restarts and hot reloads. It used to end as soon as
+	// the running instance's context was cancelled (a hot reload, a watchdog restart), and the
+	// app then showed ↑0B/s ↓0B/s for the rest of the session. Now it keeps sending one sample a
+	// second for as long as the client listens; with no running instance the speeds are 0.
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	deadline := time.NewTimer(10 * time.Second)
-	defer deadline.Stop()
-
-	ctx := h.Context()
-	if ctx == nil {
-		return E.New("service not ready")
-	}
 	current_status := h.readStatus(nil)
 	if err := stream.Send(current_status); err != nil {
-		Log(LogLevel_ERROR, LogType_CORE, "send System Info failed", err)
+		return err
 	}
 	for {
 		select {
 		case <-stream.Context().Done():
 			return nil
-		case <-ctx.Done():
-			return ctx.Err()
 		case <-ticker.C:
 			current_status = h.readStatus(current_status)
 			if err := stream.Send(current_status); err != nil {
-				// return err
-				Log(LogLevel_ERROR, LogType_CORE, "send System Info failed", err)
+				return err
 			}
 		}
 	}
-
 }
 
 // func (s *CoreService) OutboundsInfo(req *hcommon.Empty, stream grpc.ServerStreamingServer[OutboundGroupList]) error {
@@ -444,4 +431,19 @@ func (s *CoreService) GetLANIP(ctx context.Context, req *hcommon.Empty) (*LANIPR
 	}
 	// Fallback to loopback if no physical LAN interface is found
 	return &LANIPResponse{Ip: "127.0.0.1"}, nil
+}
+
+// speedSince is the traffic since the previous sample; a new instance starts its totals at 0,
+// which must read as 0 B/s rather than a negative speed.
+func speedSince(prev *SystemInfo, uplinkTotal, downlinkTotal int64) (uplink, downlink int64) {
+	if prev == nil {
+		return 0, 0
+	}
+	if uplinkTotal >= prev.UplinkTotal {
+		uplink = uplinkTotal - prev.UplinkTotal
+	}
+	if downlinkTotal >= prev.DownlinkTotal {
+		downlink = downlinkTotal - prev.DownlinkTotal
+	}
+	return uplink, downlink
 }

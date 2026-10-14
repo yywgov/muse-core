@@ -45,6 +45,12 @@ jobs:
           go-version-file: go.mod
           check-latest: false
 
+      - name: Muse unit tests
+        run: |
+          go test -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_grpc ./v2/config/ -run 'Muse|TestSetInbound' -count=1 -v 2>&1 | grep -E '^(=== RUN|--- |PASS|FAIL|ok|panic)|_test.go' 
+          test ${PIPESTATUS[0]} -eq 0
+          go test -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_grpc ./v2/hcore/ -run 'TestSpeedSince' -count=1 -v
+
       - uses: actions/setup-java@v5
         with:
           distribution: zulu

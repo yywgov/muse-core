@@ -137,6 +137,7 @@ func patchEndpoint(base *option.Endpoint, configOpt HiddifyOptions, staticIPs *m
 func patchOutbound(base option.Outbound, configOpt HiddifyOptions, staticIPs *map[string][]string) (*option.Outbound, error) {
 
 	base = patchOutboundTLSTricks(base, configOpt)
+	base = patchOutboundHysteria2Bandwidth(base, configOpt)
 
 	// switch base.Type {
 	// case C.TypeVMess, C.TypeVLESS, C.TypeTrojan, C.TypeShadowsocks:
@@ -285,3 +286,30 @@ func patchOutbound(base option.Outbound, configOpt HiddifyOptions, staticIPs *ma
 // 	}
 // 	return ""
 // }
+
+// muse: 「我的宽带」. Hysteria2 outbounds get the user's up/down bandwidth (Brutal congestion
+// control); 0 keeps the outbound's own values, i.e. BBR when the subscription sets none.
+func patchOutboundHysteria2Bandwidth(base option.Outbound, configOpt HiddifyOptions) option.Outbound {
+	if base.Type != C.TypeHysteria2 || (configOpt.Hysteria2UpMbps <= 0 && configOpt.Hysteria2DownMbps <= 0) {
+		return base
+	}
+	switch opts := base.Options.(type) {
+	case *option.Hysteria2OutboundOptions:
+		copied := *opts
+		applyHysteria2Bandwidth(&copied, configOpt)
+		base.Options = &copied
+	case option.Hysteria2OutboundOptions:
+		applyHysteria2Bandwidth(&opts, configOpt)
+		base.Options = &opts
+	}
+	return base
+}
+
+func applyHysteria2Bandwidth(opts *option.Hysteria2OutboundOptions, configOpt HiddifyOptions) {
+	if configOpt.Hysteria2UpMbps > 0 {
+		opts.UpMbps = configOpt.Hysteria2UpMbps
+	}
+	if configOpt.Hysteria2DownMbps > 0 {
+		opts.DownMbps = configOpt.Hysteria2DownMbps
+	}
+}
