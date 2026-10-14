@@ -1,0 +1,534 @@
+diff --git a/common/monitoring/h_monitoring_test.go b/common/monitoring/h_monitoring_test.go
+index 1bd0e46..372b57a 100644
+--- a/common/monitoring/h_monitoring_test.go
++++ b/common/monitoring/h_monitoring_test.go
+@@ -260,8 +260,14 @@ func TestH_MonitoringQueueAndApplyResult(t *testing.T) {
+ 	require.False(t, state.invalid)
+ 	require.Equal(t, uint16(42), m.history.LoadURLTestHistory("a").Delay)
+ 
++	// muse: one periodic failure keeps the good value (and re-tests soon); the second reports a timeout
++	kept := m.applyResult(testOutcome{outboundTag: "a", history: adapter.URLTestHistory{Delay: TimeoutDelay, Time: time.Now()}, err: errors.New("x")})
++	require.Equal(t, uint16(42), kept.Delay)
++	require.False(t, state.invalid)
++	<-m.reg().groups["grp"].notifyCh
+ 	m.applyResult(testOutcome{outboundTag: "a", history: adapter.URLTestHistory{Delay: TimeoutDelay, Time: time.Now()}, err: errors.New("x")})
+ 	require.True(t, state.invalid)
++	require.Equal(t, TimeoutDelay, state.history.Delay)
+ 	require.Equal(t, "4.4.4.4", state.history.IpInfo.IP, "ip info survives a failed test")
+ 	require.Len(t, m.reg().groups["grp"].notifyCh, 1)
+ 
+diff --git a/common/monitoring/h_registry.go b/common/monitoring/h_registry.go
+index 3a07d1d..5f7e663 100644
+--- a/common/monitoring/h_registry.go
++++ b/common/monitoring/h_registry.go
+@@ -34,6 +34,7 @@ func (m *OutboundMonitoring) buildRegistry(previous *monitoringRegistry) (*monit
+ 		if old, ok := previous.outbounds[outbound.Tag()]; ok && old.outbound == outbound {
+ 			old.mu.Lock()
+ 			state.history = old.history
++			state.latency = old.latency // muse
+ 			state.lastURL = old.lastURL
+ 			state.invalid = old.invalid
+ 			state.from_cache = old.from_cache
+diff --git a/common/monitoring/muse_latency.go b/common/monitoring/muse_latency.go
+new file mode 100644
+index 0000000..6d756fd
+--- /dev/null
++++ b/common/monitoring/muse_latency.go
+@@ -0,0 +1,115 @@
++package monitoring
++
++// muse (穿云 1.2.1): steadier node delays. The same node used to show 159 ms and then 226 ms,
++// and 自动最快 followed that jitter. Now:
++//   - a thorough test (测速, the first test of a session, the screen coming back on) throws away
++//     one warm-up probe and keeps the median of three probes run at the same time;
++//   - a periodic test (every few minutes, every 15 min with the screen off) is one probe, smoothed
++//     into the previous value (EWMA), so one slow sample moves it only part of the way;
++//   - one failed periodic probe keeps a good value and re-tests the node shortly; two failures in
++//     a row (or any failure without a good value) report the node as timed out.
++// The value is what the app shows and what the lowest-delay balancer (自动最快, 50 ms tolerance)
++// picks by, so both always agree.
++
++import (
++	"sync"
++	"time"
++)
++
++const (
++	museThoroughSamples = 3
++	// weight of a new periodic sample in the smoothed value (0.4 = 40 %)
++	museSmoothNew = 0.4
++	// periodic failures in a row before a node with a good value counts as timed out
++	museFailuresToTimeout = 2
++	museRetestAfter       = 10 * time.Second
++	museMinProbeTimeout   = 1500 * time.Millisecond
++)
++
++type museLatency struct {
++	value uint16 // 0 = none yet, TimeoutDelay = timed out
++	fails int
++}
++
++// apply takes one test result and returns the delay to report and whether to re-test soon.
++func (l *museLatency) apply(thorough bool, ok bool, delay uint16) (report uint16, retest bool) {
++	good := l.value > 0 && l.value < TimeoutDelay
++	switch {
++	case ok && thorough:
++		l.value, l.fails = delay, 0
++	case ok:
++		l.value, l.fails = museSmooth(l.value, delay), 0
++	case thorough || !good:
++		l.value, l.fails = TimeoutDelay, 0
++	default:
++		l.fails++
++		if l.fails >= museFailuresToTimeout {
++			l.value, l.fails = TimeoutDelay, 0
++		} else {
++			retest = true
++		}
++	}
++	return l.value, retest
++}
++
++// museSmooth blends a new periodic sample into the previous value.
++func museSmooth(prev, sample uint16) uint16 {
++	if prev == 0 || prev >= TimeoutDelay {
++		return sample
++	}
++	v := float64(prev)*(1-museSmoothNew) + float64(sample)*museSmoothNew
++	return uint16(v + 0.5)
++}
++
++// museProbeTimeout: after a warm-up of warm ms, a probe that takes far longer is a lost one.
++func museProbeTimeout(warm uint16, max time.Duration) time.Duration {
++	t := time.Duration(warm)*3*time.Millisecond + time.Second
++	if t < museMinProbeTimeout {
++		t = museMinProbeTimeout
++	}
++	if t > max {
++		t = max
++	}
++	return t
++}
++
++// museProbeMedian runs n probes at the same time and returns the median of those that answered.
++func museProbeMedian(probe func(time.Duration) (uint16, error), timeout time.Duration, n int) (uint16, error) {
++	var (
++		wg      sync.WaitGroup
++		mu      sync.Mutex
++		ok      []uint16
++		lastErr error
++	)
++	for i := 0; i < n; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			d, err := probe(timeout)
++			mu.Lock()
++			defer mu.Unlock()
++			if err != nil {
++				lastErr = err
++				return
++			}
++			ok = append(ok, d)
++		}()
++	}
++	wg.Wait()
++	if len(ok) == 0 {
++		return TimeoutDelay, lastErr
++	}
++	return medianDelay(ok), nil
++}
++
++// scheduleRetest tests a node again shortly after its first periodic failure.
++func (m *OutboundMonitoring) scheduleRetest(tag string) {
++	go func() {
++		select {
++		case <-m.ctx.Done():
++			return
++		case <-time.After(museRetestAfter):
++		}
++		m.enqueueTask(&testTask{outboundTag: tag, cycleID: m.cycleSeq + 1_000_000})
++	}()
++}
+diff --git a/common/monitoring/muse_latency_test.go b/common/monitoring/muse_latency_test.go
+new file mode 100644
+index 0000000..f7fd0e3
+--- /dev/null
++++ b/common/monitoring/muse_latency_test.go
+@@ -0,0 +1,148 @@
++package monitoring
++
++import (
++	"context"
++	"errors"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestMuseLatencyThoroughSetsMedian(t *testing.T) {
++	var l museLatency
++	r, retest := l.apply(true, true, 159)
++	require.Equal(t, uint16(159), r)
++	require.False(t, retest)
++	// a thorough failure (the user pressed 测速) reports the timeout at once
++	r, _ = l.apply(true, false, TimeoutDelay)
++	require.Equal(t, TimeoutDelay, r)
++}
++
++func TestMuseLatencyPeriodicSmoothing(t *testing.T) {
++	l := museLatency{value: 160}
++	r, _ := l.apply(false, true, 226) // one slow sample moves it only part of the way
++	require.Equal(t, uint16(186), r)  // 160*0.6 + 226*0.4 = 186.4
++	r, _ = l.apply(false, true, 160)
++	require.Equal(t, uint16(176), r)
++	require.Equal(t, uint16(200), museSmooth(0, 200))
++	require.Equal(t, uint16(200), museSmooth(TimeoutDelay, 200))
++}
++
++func TestMuseLatencyPeriodicFailureKeepsGoodValue(t *testing.T) {
++	l := museLatency{value: 180}
++	r, retest := l.apply(false, false, TimeoutDelay)
++	require.Equal(t, uint16(180), r, "one lost probe does not wipe a good value")
++	require.True(t, retest, "but the node is re-tested soon")
++	r, _ = l.apply(false, true, 200) // recovered: failures reset
++	require.Equal(t, uint16(188), r)
++	l.apply(false, false, TimeoutDelay)
++	r, retest = l.apply(false, false, TimeoutDelay)
++	require.Equal(t, TimeoutDelay, r, "two failures in a row: timed out")
++	require.False(t, retest)
++	// without a good value a failure is a timeout right away
++	var fresh museLatency
++	r, _ = fresh.apply(false, false, TimeoutDelay)
++	require.Equal(t, TimeoutDelay, r)
++}
++
++func TestMuseProbeMedian(t *testing.T) {
++	var i atomic.Int32
++	values := []uint16{150, 400, 160}
++	d, err := museProbeMedian(func(time.Duration) (uint16, error) {
++		return values[i.Add(1)-1], nil
++	}, time.Second, 3)
++	require.NoError(t, err)
++	require.Equal(t, uint16(160), d)
++
++	i.Store(0)
++	d, err = museProbeMedian(func(time.Duration) (uint16, error) {
++		if i.Add(1) == 2 {
++			return 0, errors.New("lost")
++		}
++		return 200, nil
++	}, time.Second, 3)
++	require.NoError(t, err)
++	require.Equal(t, uint16(200), d, "a lost probe is left out")
++
++	_, err = museProbeMedian(func(time.Duration) (uint16, error) { return 0, errors.New("down") }, time.Second, 3)
++	require.Error(t, err)
++}
++
++func TestMuseProbeTimeout(t *testing.T) {
++	require.Equal(t, museMinProbeTimeout, museProbeTimeout(50, 5*time.Second))
++	require.Equal(t, 2500*time.Millisecond, museProbeTimeout(500, 5*time.Second))
++	require.Equal(t, 5*time.Second, museProbeTimeout(3000, 5*time.Second))
++}
++
++// The thorough test (warm-up + 3 concurrent probes) of 30 nodes with 10 workers must not take
++// much longer than the old single probe: about two round trips per node instead of one.
++func TestMuseThoroughTestTiming(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	defer server.Close()
++	serverAddr := M.ParseSocksaddr(server.Listener.Addr().String())
++	var dialer net.Dialer
++	const nodes = 30
++	var outbounds []adapter.Outbound
++	var tags []string
++	for n := 0; n < nodes; n++ {
++		tag := "node" + string(rune('A'+n))
++		tags = append(tags, tag)
++		outbounds = append(outbounds, &fakeOutbound{tag: tag, dial: func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++			if destination != serverAddr {
++				return nil, errors.New("unreachable")
++			}
++			select { // a 120 ms connect, like a real node
++			case <-time.After(120 * time.Millisecond):
++			case <-ctx.Done():
++				return nil, ctx.Err()
++			}
++			return dialer.DialContext(ctx, network, destination.String())
++		}})
++	}
++	m := newTestMonitor(t, nil, option.MonitoringOptions{
++		URLs:           []string{server.URL + "/generate_204"},
++		URLTestTimeout: badoption.Duration(5 * time.Second),
++	}, outbounds...)
++	require.NoError(t, m.Start(adapter.StartStateInitialize))
++
++	run := func(thorough bool) time.Duration {
++		start := time.Now()
++		work := make(chan string)
++		var wg sync.WaitGroup
++		for w := 0; w < defaultWorkerCount; w++ {
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				for tag := range work {
++					h, err := m.tester(context.Background(), tag, thorough)
++					require.NoError(t, err)
++					require.Less(t, h.Delay, TimeoutDelay)
++				}
++			}()
++		}
++		for _, tag := range tags {
++			work <- tag
++		}
++		close(work)
++		wg.Wait()
++		return time.Since(start)
++	}
++	single := run(false)
++	thorough := run(true)
++	t.Logf("muse timing: %d nodes, %d workers: single probe %v, thorough (warm-up + 3 concurrent) %v, ratio %.2f",
++		nodes, defaultWorkerCount, single.Round(time.Millisecond), thorough.Round(time.Millisecond), float64(thorough)/float64(single))
++	require.Less(t, thorough, single*3, "thorough test stays within ~2 round trips per node")
++}
+diff --git a/common/monitoring/outbound_monitoring.go b/common/monitoring/outbound_monitoring.go
+index a36ab98..c1b1b7c 100644
+--- a/common/monitoring/outbound_monitoring.go
++++ b/common/monitoring/outbound_monitoring.go
+@@ -362,15 +362,20 @@ func (m *OutboundMonitoring) signalChange(outboundTag string, visited map[string
+ 		m.signalChange(dependent, visited)
+ 	}
+ }
++// TestNow is a test the user asked for (测速): muse — every node gets the thorough test
++// (one warm-up probe, then three probes; the median is kept).
+ func (m *OutboundMonitoring) TestNow(outboundTag string) error {
+ 	m.testParents(outboundTag, true)
+-	return m.testNow(outboundTag, true)
++	return m.testNowThorough(outboundTag, true, true)
+ }
+ func (m *OutboundMonitoring) testNow(outboundTag string, priority bool) error {
++	return m.testNowThorough(outboundTag, priority, false)
++}
++func (m *OutboundMonitoring) testNowThorough(outboundTag string, priority bool, thorough bool) error {
+ 	m.logger.Info("testing outbound ", outboundTag, " with priority: ", priority)
+ 	if grp, ok := m.reg().groups[outboundTag]; ok {
+ 		for tag := range grp.outbounds {
+-			m.testNow(tag, false)
++			m.testNowThorough(tag, false, thorough)
+ 		}
+ 	} else {
+ 		state := m.getState(outboundTag)
+@@ -382,6 +387,7 @@ func (m *OutboundMonitoring) testNow(outboundTag string, priority bool) error {
+ 			outboundTag: outboundTag,
+ 			cycleID:     m.cycleSeq,
+ 			priority:    priority,
++			thorough:    thorough,
+ 		}
+ 
+ 		if !m.enqueueTask(task) {
+@@ -545,10 +551,15 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
+ 		}()
+ 		return
+ 	}
++	// muse: a node without a live value (new session, loaded from the cache, timed out) also
++	// gets the thorough test, so the first number shown is already a stable median
++	state.mu.Lock()
++	thorough := task.thorough || state.latency.value == 0 || state.latency.value >= TimeoutDelay || state.from_cache
++	state.mu.Unlock()
+ 	done := make(chan struct{})
+ 	go func() {
+ 		defer close(done)
+-		delay, err := m.tester(m.ctx, task.outboundTag)
++		delay, err := m.tester(m.ctx, task.outboundTag, thorough)
+ 
+ 		outcome := testOutcome{
+ 			outboundTag: task.outboundTag,
+@@ -556,6 +567,7 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
+ 			err:         err,
+ 			cycleID:     task.cycleID,
+ 			priority:    task.priority,
++			thorough:    thorough,
+ 		}
+ 
+ 		m.applyResult(outcome)
+@@ -576,37 +588,38 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
+ 
+ }
+ 
+-func (m *OutboundMonitoring) tester(parent context.Context, tag string) (adapter.URLTestHistory, error) {
++func (m *OutboundMonitoring) tester(parent context.Context, tag string, thorough bool) (adapter.URLTestHistory, error) {
+ 	out, ok := m.reg().outbounds[tag]
+ 	if !ok {
+ 		return adapter.URLTestHistory{Delay: 0}, errors.New("outbound not registered")
+ 	}
+ 
+ 	idx := m.currentLinkIndex.Load()
+-
+-	ctx, cancel := context.WithTimeout(parent, m.urlTestTimeout)
+-	defer cancel()
+-
+-	delay, err := urltest.URLTest(ctx, m.urls[idx], out.outbound)
+-	// muse: the first test of a session (no samples yet) also warms the connection up:
+-	// two more probes follow and the median of the three is kept, so the first number
+-	// shown is already stable instead of a cold-start outlier.
+-	out.mu.Lock()
+-	firstTest := len(out.samples) == 0
+-	out.mu.Unlock()
+-	if err == nil && delay < TimeoutDelay && firstTest {
+-		probes := []uint16{delay}
+-		for i := 0; i < 2; i++ {
+-			if ctx.Err() != nil {
+-				break
+-			}
+-			d, e := urltest.URLTest(ctx, m.urls[idx], out.outbound)
+-			if e != nil || d >= TimeoutDelay {
+-				break
+-			}
+-			probes = append(probes, d)
++	link := m.urls[idx]
++	probe := func(timeout time.Duration) (uint16, error) {
++		ctx, cancel := context.WithTimeout(parent, timeout)
++		defer cancel()
++		d, e := urltest.URLTest(ctx, link, out.outbound)
++		if e == nil && d >= TimeoutDelay {
++			e = errors.New("timeout")
+ 		}
+-		delay = medianDelay(probes)
++		return d, e
++	}
++	// muse (穿云 1.2.1): a thorough test (测速, first test of a session, screen back on) is one
++	// warm-up probe that is thrown away (DNS, cold handshake), then three probes run at the same
++	// time; the median of those that answered is the node's delay. The probes share the node, so
++	// the test takes about two round trips, not four. A periodic test is a single probe that is
++	// smoothed with the previous value (see museLatency.apply).
++	var delay uint16
++	var err error
++	if thorough {
++		var warm uint16
++		warm, err = probe(m.urlTestTimeout)
++		if err == nil {
++			delay, err = museProbeMedian(probe, museProbeTimeout(warm, m.urlTestTimeout), museThoroughSamples)
++		}
++	} else {
++		delay, err = probe(m.urlTestTimeout)
+ 	}
+ 
+ 	his := adapter.URLTestHistory{
+@@ -628,12 +641,10 @@ func (m *OutboundMonitoring) tester(parent context.Context, tag string) (adapter
+ 		ctx, cancel2 := context.WithTimeout(parent, m.urlTestTimeout)
+ 		defer cancel2()
+ 
+-		newip, t, err := ipinfo.GetIpInfo(m.logger, ctx, out.outbound)
++		// muse: the IP lookup's own time no longer lowers the delay (it is not the same measure)
++		newip, _, err := ipinfo.GetIpInfo(m.logger, ctx, out.outbound)
+ 		if err == nil {
+ 			his.IpInfo = mergeIpInfo(out.history.IpInfo, newip)
+-			if t < his.Delay {
+-				his.Delay = t
+-			}
+ 		}
+ 	}
+ 	if his.IpInfo != nil {
+@@ -659,6 +670,8 @@ func (m *OutboundMonitoring) startCycleOnce() bool {
+ func (m *OutboundMonitoring) runCycle() {
+ 	cycleID := atomic.AddUint64(&m.cycleSeq, 1)
+ 	m.lastCycle.Store(time.Now())
++	// muse: the cycle right after the screen comes back on is a foreground test (thorough)
++	thorough := m.forceAll.Load()
+ 	tags := m.collectCycleTargets()
+ 
+ 	if len(tags) == 0 {
+@@ -671,7 +684,7 @@ func (m *OutboundMonitoring) runCycle() {
+ 	}()
+ 
+ 	for idx, _ := range m.urls {
+-		outcomes := m.runStage(cycleID, tags)
++		outcomes := m.runStage(cycleID, tags, thorough)
+ 		success := 0
+ 		for _, result := range outcomes {
+ 			if result.err == nil {
+@@ -685,7 +698,7 @@ func (m *OutboundMonitoring) runCycle() {
+ 	}
+ }
+ 
+-func (m *OutboundMonitoring) runStage(cycleID uint64, tags []string) []testOutcome {
++func (m *OutboundMonitoring) runStage(cycleID uint64, tags []string, thorough bool) []testOutcome {
+ 	resultCh := make(chan testOutcome, len(tags))
+ 
+ 	expected := 0
+@@ -699,6 +712,7 @@ func (m *OutboundMonitoring) runStage(cycleID uint64, tags []string) []testOutco
+ 			outboundTag: tag,
+ 			cycleID:     cycleID,
+ 			priority:    false,
++			thorough:    thorough,
+ 			resultCh:    resultCh,
+ 		}
+ 		if m.enqueueTask(task) {
+@@ -788,15 +802,19 @@ func (m *OutboundMonitoring) applyResult(outcome testOutcome) *adapter.URLTestHi
+ 	if (outcome.history.Delay != state.history.Delay) || state.history.IpInfo == nil || (outcome.history.IpInfo != nil) {
+ 		m.cacheDirty.Store(true)
+ 	}
+-	if outcome.err == nil && outcome.history.Delay > 0 && outcome.history.Delay < TimeoutDelay {
+-		state.samples = append(state.samples, outcome.history.Delay)
+-		if len(state.samples) > 3 {
+-			state.samples = state.samples[len(state.samples)-3:]
+-		}
+-		outcome.history.Delay = medianDelay(state.samples)
++	// muse (穿云 1.2.1): one value for the list and for 自动最快 — a thorough test sets it to the
++	// median, a periodic sample is smoothed into it, and a single periodic failure keeps a good
++	// value (and re-tests soon) instead of reporting the node dead at once.
++	okSample := outcome.err == nil && outcome.history.Delay > 0 && outcome.history.Delay < TimeoutDelay
++	reported, retest := state.latency.apply(outcome.thorough, okSample, outcome.history.Delay)
++	outcome.history.Delay = reported
++	if retest {
++		m.scheduleRetest(outcome.outboundTag)
++	}
++	if okSample || reported >= TimeoutDelay {
++		state.invalid = !okSample
+ 	} else {
+-		// a failure counts at once: the node is reported as timed out
+-		state.samples = state.samples[:0]
++		state.invalid = false // still serving the kept value
+ 	}
+ 	state.history.Delay = outcome.history.Delay
+ 	state.history.Time = outcome.history.Time
+@@ -981,6 +999,7 @@ type testTask struct {
+ 	outboundTag string
+ 	cycleID     uint64
+ 	priority    bool
++	thorough    bool // muse: warm-up + 3 probes, median
+ 	resultCh    chan<- testOutcome
+ }
+ 
+@@ -991,6 +1010,7 @@ type testOutcome struct {
+ 	err         error
+ 	cycleID     uint64
+ 	priority    bool
++	thorough    bool
+ }
+ 
+ type outboundState struct {
+@@ -1009,8 +1029,8 @@ type outboundState struct {
+ 	enqueuedCycle  uint64
+ 	from_cache     bool
+ 
+-	// muse: recent successful delays; the reported delay is their median
+-	samples []uint16
++	// muse: the node's delay as reported (median of a thorough test, smoothed by periodic ones)
++	latency museLatency
+ 
+ 	history adapter.URLTestHistory
+ }

@@ -51,6 +51,14 @@ jobs:
           test ${PIPESTATUS[0]} -eq 0
           go test -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_grpc ./v2/hcore/ -run 'TestSpeedSince' -count=1 -v
 
+      # 穿云 1.2.1: steady node delays (patch 0003) + the monitoring / balancer tests around them;
+      # the timing test logs "muse timing:" (single probe vs thorough test of 30 nodes)
+      - name: Muse sing-box tests (monitoring / balancer)
+        working-directory: hiddify-sing-box
+        run: |
+          go test -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_utls,with_clash_api ./common/monitoring/ ./protocol/group/balancer/ -count=1 -v 2>&1 | grep -E '^(=== RUN|--- |PASS|FAIL|ok|panic)|_test.go|muse timing'
+          test ${PIPESTATUS[0]} -eq 0
+
       - uses: actions/setup-java@v5
         with:
           distribution: zulu
