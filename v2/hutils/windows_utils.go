@@ -14,7 +14,10 @@ import (
 )
 
 func RedirectStderr(path string) error {
-	return fmt.Errorf("not supported on windows")
+	if err := redirectStderrWindows(path); err != nil {
+		return fmt.Errorf("redirect stderr: %w", err)
+	}
+	return nil
 }
 
 func IsAdmin() bool {
