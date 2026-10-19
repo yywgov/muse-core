@@ -1,0 +1,189 @@
+diff --git a/common/monitoring/muse_latency.go b/common/monitoring/muse_latency.go
+index 6d756fd..d59dfbf 100644
+--- a/common/monitoring/muse_latency.go
++++ b/common/monitoring/muse_latency.go
+@@ -12,23 +12,68 @@ package monitoring
+ // picks by, so both always agree.
+ 
+ import (
++	"sort"
+ 	"sync"
+ 	"time"
+ )
+ 
+ const (
+-	museThoroughSamples = 3
++	museThoroughSamples = 5
++	// 穿云 1.2.5: samples kept per node across tests (the shown value is their median), and how
++	// long a sample stays relevant
++	museSampleWindow = 6
++	museSampleMaxAge = 3 * time.Minute
+ 	// weight of a new periodic sample in the smoothed value (0.4 = 40 %)
+ 	museSmoothNew = 0.4
+ 	// periodic failures in a row before a node with a good value counts as timed out
+ 	museFailuresToTimeout = 2
+ 	museRetestAfter       = 10 * time.Second
+-	museMinProbeTimeout   = 1500 * time.Millisecond
++	museMinProbeTimeout   = 3 * time.Second
+ )
+ 
+ type museLatency struct {
+-	value uint16 // 0 = none yet, TimeoutDelay = timed out
+-	fails int
++	value   uint16 // 0 = none yet, TimeoutDelay = timed out
++	fails   int
++	samples []museSample
++}
++
++type museSample struct {
++	delay uint16
++	at    time.Time
++}
++
++// addSamples keeps the newest museSampleWindow samples younger than museSampleMaxAge and returns
++// their median, so tapping 测速 again refines the value instead of replacing it (timeout, 500,
++// 300 on three taps became one steady number).
++func (l *museLatency) addSamples(now time.Time, delays ...uint16) uint16 {
++	kept := l.samples[:0]
++	for _, s := range l.samples {
++		if now.Sub(s.at) <= museSampleMaxAge {
++			kept = append(kept, s)
++		}
++	}
++	for _, d := range delays {
++		if d > 0 && d < TimeoutDelay {
++			kept = append(kept, museSample{d, now})
++		}
++	}
++	if len(kept) > museSampleWindow {
++		kept = kept[len(kept)-museSampleWindow:]
++	}
++	l.samples = kept
++	if len(kept) == 0 {
++		return 0
++	}
++	ds := make([]uint16, len(kept))
++	for i, s := range kept {
++		ds[i] = s.delay
++	}
++	sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
++	n := len(ds)
++	if n%2 == 1 {
++		return ds[n/2]
++	}
++	return uint16((uint32(ds[n/2-1]) + uint32(ds[n/2]) + 1) / 2)
+ }
+ 
+ // apply takes one test result and returns the delay to report and whether to re-test soon.
+@@ -36,15 +81,18 @@ func (l *museLatency) apply(thorough bool, ok bool, delay uint16) (report uint16
+ 	good := l.value > 0 && l.value < TimeoutDelay
+ 	switch {
+ 	case ok && thorough:
+-		l.value, l.fails = delay, 0
++		l.value, l.fails = l.addSamples(time.Now(), delay), 0
+ 	case ok:
+ 		l.value, l.fails = museSmooth(l.value, delay), 0
+-	case thorough || !good:
+-		l.value, l.fails = TimeoutDelay, 0
++		l.addSamples(time.Now(), delay)
++	case !good:
++		// 穿云 1.2.5: a thorough test failing on a node that was working also gets one more
++		// chance (a lost probe on a mobile network), so one tap no longer shows 超时 by mistake
++		l.value, l.fails, l.samples = TimeoutDelay, 0, nil
+ 	default:
+ 		l.fails++
+ 		if l.fails >= museFailuresToTimeout {
+-			l.value, l.fails = TimeoutDelay, 0
++			l.value, l.fails, l.samples = TimeoutDelay, 0, nil
+ 		} else {
+ 			retest = true
+ 		}
+@@ -63,7 +111,7 @@ func museSmooth(prev, sample uint16) uint16 {
+ 
+ // museProbeTimeout: after a warm-up of warm ms, a probe that takes far longer is a lost one.
+ func museProbeTimeout(warm uint16, max time.Duration) time.Duration {
+-	t := time.Duration(warm)*3*time.Millisecond + time.Second
++	t := time.Duration(warm)*4*time.Millisecond + 1500*time.Millisecond
+ 	if t < museMinProbeTimeout {
+ 		t = museMinProbeTimeout
+ 	}
+diff --git a/common/monitoring/muse_latency_test.go b/common/monitoring/muse_latency_test.go
+index f7fd0e3..d259655 100644
+--- a/common/monitoring/muse_latency_test.go
++++ b/common/monitoring/muse_latency_test.go
+@@ -24,11 +24,40 @@ func TestMuseLatencyThoroughSetsMedian(t *testing.T) {
+ 	r, retest := l.apply(true, true, 159)
+ 	require.Equal(t, uint16(159), r)
+ 	require.False(t, retest)
+-	// a thorough failure (the user pressed 测速) reports the timeout at once
++	// 穿云 1.2.5: a thorough failure on a working node keeps the value once and re-tests
++	r, retest = l.apply(true, false, TimeoutDelay)
++	require.Equal(t, uint16(159), r)
++	require.True(t, retest)
+ 	r, _ = l.apply(true, false, TimeoutDelay)
++	require.Equal(t, TimeoutDelay, r, "second failure in a row: timed out")
++	// a node that never worked times out at once
++	var fresh museLatency
++	r, _ = fresh.apply(true, false, TimeoutDelay)
+ 	require.Equal(t, TimeoutDelay, r)
+ }
+ 
++// 穿云 1.2.5: repeated 测速 taps refine one value instead of jumping between readings.
++func TestMuseLatencyRepeatedTapsAreSteady(t *testing.T) {
++	var l museLatency
++	r, _ := l.apply(true, true, 500)
++	require.Equal(t, uint16(500), r)
++	r, _ = l.apply(true, true, 300)
++	require.Equal(t, uint16(400), r) // median of {500, 300}
++	r, _ = l.apply(true, true, 320)
++	require.Equal(t, uint16(320), r) // median of {500, 300, 320}
++	r, _ = l.apply(true, true, 900) // one bad reading barely moves it
++	require.Equal(t, uint16(410), r) // median of {500, 300, 320, 900}
++	// old samples age out
++	l.samples[0].at = time.Now().Add(-2 * museSampleMaxAge)
++	require.Equal(t, uint16(320), l.addSamples(time.Now()))
++	// a timeout clears the window
++	l.apply(true, false, TimeoutDelay)
++	l.apply(true, false, TimeoutDelay)
++	require.Empty(t, l.samples)
++	r, _ = l.apply(true, true, 250)
++	require.Equal(t, uint16(250), r)
++}
++
+ func TestMuseLatencyPeriodicSmoothing(t *testing.T) {
+ 	l := museLatency{value: 160}
+ 	r, _ := l.apply(false, true, 226) // one slow sample moves it only part of the way
+@@ -81,7 +110,7 @@ func TestMuseProbeMedian(t *testing.T) {
+ 
+ func TestMuseProbeTimeout(t *testing.T) {
+ 	require.Equal(t, museMinProbeTimeout, museProbeTimeout(50, 5*time.Second))
+-	require.Equal(t, 2500*time.Millisecond, museProbeTimeout(500, 5*time.Second))
++	require.Equal(t, 3500*time.Millisecond, museProbeTimeout(500, 5*time.Second))
+ 	require.Equal(t, 5*time.Second, museProbeTimeout(3000, 5*time.Second))
+ }
+ 
+diff --git a/common/monitoring/outbound_monitoring.go b/common/monitoring/outbound_monitoring.go
+index c1b1b7c..99846fc 100644
+--- a/common/monitoring/outbound_monitoring.go
++++ b/common/monitoring/outbound_monitoring.go
+@@ -613,11 +613,17 @@ func (m *OutboundMonitoring) tester(parent context.Context, tag string, thorough
+ 	var delay uint16
+ 	var err error
+ 	if thorough {
++		// 穿云 1.2.5: a lost warm-up no longer fails the whole test (it was the "超时" on the
++		// first tap); the samples then get the full timeout, and the node counts as timed out
++		// only when every probe failed.
+ 		var warm uint16
+-		warm, err = probe(m.urlTestTimeout)
+-		if err == nil {
+-			delay, err = museProbeMedian(probe, museProbeTimeout(warm, m.urlTestTimeout), museThoroughSamples)
++		var werr error
++		warm, werr = probe(m.urlTestTimeout)
++		timeout := m.urlTestTimeout
++		if werr == nil {
++			timeout = museProbeTimeout(warm, m.urlTestTimeout)
+ 		}
++		delay, err = museProbeMedian(probe, timeout, museThoroughSamples)
+ 	} else {
+ 		delay, err = probe(m.urlTestTimeout)
+ 	}
