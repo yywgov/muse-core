@@ -4,7 +4,7 @@ import (
 	context "context"
 	"encoding/base64"
 	"fmt"
-	"math/rand"
+	"crypto/rand"
 	"net"
 	"net/netip"
 	"net/url"
