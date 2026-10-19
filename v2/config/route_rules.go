@@ -289,6 +289,7 @@ func (b *appRouteRules) ruleSet(url string) (string, bool) {
 			URL:            url,
 			UpdateInterval: badoption.Duration(5 * time.Hour * 24),
 			DownloadDetour: OutboundSelectTag,
+			InitialPath:    museRuleSetInitialPath(url),
 		},
 	})
 	return tag, true

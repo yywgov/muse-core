@@ -1,0 +1,13 @@
+diff --git a/route/rule/rule_set_remote.go b/route/rule/rule_set_remote.go
+index 648b5b1..2af8aba 100644
+--- a/route/rule/rule_set_remote.go
++++ b/route/rule/rule_set_remote.go
+@@ -35,7 +35,7 @@ var _ adapter.RuleSet = (*RemoteRuleSet)(nil)
+ 
+ // H: limits of rule-set downloads
+ var (
+-	hRuleSetInitialFetchTimeout = 15 * time.Second
++	hRuleSetInitialFetchTimeout = 5 * time.Second // muse: the app ships the common lists (initial_path); never hold the connect long
+ 	hRuleSetFetchTimeout        = 2 * time.Minute
+ )
+ 

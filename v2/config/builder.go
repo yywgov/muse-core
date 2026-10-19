@@ -2,9 +2,9 @@ package config
 
 import (
 	context "context"
+	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"crypto/rand"
 	"net"
 	"net/netip"
 	"net/url"
@@ -778,6 +778,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 				URL:            "https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/block/geosite-category-ads-all.srs",
 				UpdateInterval: badoption.Duration(5 * time.Hour * 24),
 				DownloadDetour: OutboundSelectTag,
+				InitialPath:    museRuleSetInitialPath("https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/block/geosite-category-ads-all.srs"),
 			},
 		})
 		rulesets = append(rulesets, option.RuleSet{
@@ -788,6 +789,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 				URL:            "https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/block/geosite-malware.srs",
 				UpdateInterval: badoption.Duration(5 * time.Hour * 24),
 				DownloadDetour: OutboundSelectTag,
+				InitialPath:    museRuleSetInitialPath("https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/block/geosite-malware.srs"),
 			},
 		})
 		rulesets = append(rulesets, option.RuleSet{
@@ -798,6 +800,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 				URL:            "https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/block/geosite-phishing.srs",
 				UpdateInterval: badoption.Duration(5 * time.Hour * 24),
 				DownloadDetour: OutboundSelectTag,
+				InitialPath:    museRuleSetInitialPath("https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/block/geosite-phishing.srs"),
 			},
 		})
 		rulesets = append(rulesets, option.RuleSet{
@@ -808,6 +811,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 				URL:            "https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/block/geosite-cryptominers.srs",
 				UpdateInterval: badoption.Duration(5 * time.Hour * 24),
 				DownloadDetour: OutboundSelectTag,
+				InitialPath:    museRuleSetInitialPath("https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/block/geosite-cryptominers.srs"),
 			},
 		})
 		rulesets = append(rulesets, option.RuleSet{
@@ -818,6 +822,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 				URL:            "https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/block/geoip-phishing.srs",
 				UpdateInterval: badoption.Duration(5 * time.Hour * 24),
 				DownloadDetour: OutboundSelectTag,
+				InitialPath:    museRuleSetInitialPath("https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/block/geoip-phishing.srs"),
 			},
 		})
 		rulesets = append(rulesets, option.RuleSet{
@@ -828,6 +833,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 				URL:            "https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/block/geoip-malware.srs",
 				UpdateInterval: badoption.Duration(5 * time.Hour * 24),
 				DownloadDetour: OutboundSelectTag,
+				InitialPath:    museRuleSetInitialPath("https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/block/geoip-malware.srs"),
 			},
 		})
 
@@ -925,6 +931,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 				URL:            "https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/country/geoip-" + hopt.Region + ".srs",
 				UpdateInterval: badoption.Duration(5 * time.Hour * 24),
 				DownloadDetour: OutboundSelectTag,
+				InitialPath:    museRuleSetInitialPath("https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/country/geoip-" + hopt.Region + ".srs"),
 			},
 		})
 		rulesets = append(rulesets, option.RuleSet{
@@ -935,6 +942,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 				URL:            "https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/country/geosite-" + hopt.Region + ".srs",
 				UpdateInterval: badoption.Duration(5 * time.Hour * 24),
 				DownloadDetour: OutboundSelectTag,
+				InitialPath:    museRuleSetInitialPath("https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/country/geosite-" + hopt.Region + ".srs"),
 			},
 		})
 
