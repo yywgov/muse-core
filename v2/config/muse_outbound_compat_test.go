@@ -8,6 +8,7 @@ import (
 
 	box "github.com/sagernet/sing-box"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/experimental/libbox"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/hiddify/hinvalid"
 )
@@ -140,6 +141,9 @@ func TestMuseFixesStoredBrokenECH(t *testing.T) {
 	built, err := BuildConfig(ctx, DefaultHiddifyOptions(), &ReadOptions{Options: input})
 	if err != nil {
 		t.Fatalf("build: %v", err)
+	}
+	if err := libbox.CheckConfigOptions(built); err != nil {
+		t.Fatalf("built config rejected: %v", err)
 	}
 	tls, _ := museTLS(t, built, "stored")
 	if tls.ECH == nil || len(tls.ECH.Config) != 0 || tls.ECH.QueryServerName != "cloudflare-ech.com" {
