@@ -1,0 +1,93 @@
+diff --git a/common/tls/ech.go b/common/tls/ech.go
+index 46ab50a..fbe5952 100644
+--- a/common/tls/ech.go
++++ b/common/tls/ech.go
+@@ -113,8 +113,17 @@ type ECHClientConfig struct {
+ 	queryServerName string
+ 	lastTTL         time.Duration
+ 	lastUpdate      time.Time
++	// muse: when the ECH config list cannot be fetched, the handshake goes on without ECH
++	// (like a node without ECH) instead of failing every connection; retried after echRetryInterval.
++	lastFailure time.Time
+ }
+ 
++// muse: how long a failed ECH config lookup is remembered before it is tried again
++const echRetryInterval = time.Minute
++
++// muse: upper bound for one ECH config lookup, so a slow DNS server cannot stall the dial
++const echQueryTimeout = 5 * time.Second
++
+ func (s *ECHClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) (aTLS.Conn, error) {
+ 	tlsConn, err := s.fetchAndHandshake(ctx, conn)
+ 	if err != nil {
+@@ -131,6 +140,22 @@ func (s *ECHClientConfig) fetchAndHandshake(ctx context.Context, conn net.Conn)
+ 	s.access.Lock()
+ 	defer s.access.Unlock()
+ 	if len(s.ECHConfigList()) == 0 || s.lastTTL == 0 || time.Since(s.lastUpdate) > s.lastTTL {
++		if !s.lastFailure.IsZero() && time.Since(s.lastFailure) < echRetryInterval {
++			return s.Client(conn)
++		}
++		if err := s.fetchECHConfigList(ctx); err != nil {
++			s.lastFailure = time.Now()
++			return s.Client(conn)
++		}
++		s.lastFailure = time.Time{}
++	}
++	return s.Client(conn)
++}
++
++func (s *ECHClientConfig) fetchECHConfigList(ctx context.Context) error {
++	ctx, cancel := context.WithTimeout(ctx, echQueryTimeout)
++	defer cancel()
++	{
+ 		queryServerName := s.queryServerName
+ 		if queryServerName == "" {
+ 			queryServerName = s.ServerName()
+@@ -147,12 +172,15 @@ func (s *ECHClientConfig) fetchAndHandshake(ctx context.Context, conn net.Conn)
+ 				},
+ 			},
+ 		}
++		if s.dnsRouter == nil {
++			return E.New("fetch ECH config list: no DNS router")
++		}
+ 		response, err := s.dnsRouter.Exchange(ctx, message, adapter.DNSQueryOptions{})
+ 		if err != nil {
+-			return nil, E.Cause(err, "fetch ECH config list")
++			return E.Cause(err, "fetch ECH config list")
+ 		}
+ 		if response.Rcode != mDNS.RcodeSuccess {
+-			return nil, E.Cause(dns.RcodeError(response.Rcode), "fetch ECH config list")
++			return E.Cause(dns.RcodeError(response.Rcode), "fetch ECH config list")
+ 		}
+ 	match:
+ 		for _, rr := range response.Answer {
+@@ -162,7 +190,7 @@ func (s *ECHClientConfig) fetchAndHandshake(ctx context.Context, conn net.Conn)
+ 					if value.Key().String() == "ech" {
+ 						echConfigList, err := base64.StdEncoding.DecodeString(value.String())
+ 						if err != nil {
+-							return nil, E.Cause(err, "decode ECH config")
++							return E.Cause(err, "decode ECH config")
+ 						}
+ 						s.lastTTL = time.Duration(rr.Header().Ttl) * time.Second
+ 						s.lastUpdate = time.Now()
+@@ -173,10 +201,10 @@ func (s *ECHClientConfig) fetchAndHandshake(ctx context.Context, conn net.Conn)
+ 			}
+ 		}
+ 		if len(s.ECHConfigList()) == 0 {
+-			return nil, E.New("no ECH config found in DNS records")
++			return E.New("no ECH config found in DNS records")
+ 		}
+ 	}
+-	return s.Client(conn)
++	return nil
+ }
+ 
+ func (s *ECHClientConfig) Clone() Config {
+@@ -185,6 +213,7 @@ func (s *ECHClientConfig) Clone() Config {
+ 		dnsRouter:        s.dnsRouter,
+ 		queryServerName:  s.queryServerName,
+ 		lastUpdate:       s.lastUpdate,
++		lastFailure:      s.lastFailure,
+ 	}
+ }
+ 

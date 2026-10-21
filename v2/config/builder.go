@@ -66,6 +66,8 @@ func BuildConfig(ctx context.Context, hopts *HiddifyOptions, inputOpt *ReadOptio
 	if err != nil {
 		return nil, err
 	}
+	// 穿云: also fixes profiles parsed by an older core (no subscription update needed)
+	museFixOutbounds(input.Outbounds)
 
 	var options option.Options
 	if hopts.EnableFullConfig {
@@ -585,6 +587,8 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 		return err
 	}
 
+	// 穿云: ECH config lookups of the nodes go to the direct DNS (the remote DNS needs the node itself)
+	dnsRules = append(dnsRules, museECHDNSRules(options.Outbounds, hopt)...)
 	dnsRules = append(dnsRules, forceDirectRules...)
 
 	routeRules = append(routeRules, option.Rule{

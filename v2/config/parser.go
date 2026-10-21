@@ -151,6 +151,8 @@ func patchConfigStr(ctx context.Context, content []byte, name string, configOpt 
 func patchConfigOptions(ctx context.Context, options *option.Options, name string, configOpt *HiddifyOptions) (*option.Options, error) {
 	// dns outbounds were removed in sing-box 1.13; drop them instead of keeping invalid placeholders
 	options.Outbounds = slices.DeleteFunc(options.Outbounds, isDNSOutbound)
+	// 穿云: values other clients accept (Xray ECH forms, fingerprints, ?ed=, empty SNI)
+	museFixOutbounds(options.Outbounds)
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[*option.Endpoint](2))
 	for _, base := range options.Endpoints {
 		out := base
