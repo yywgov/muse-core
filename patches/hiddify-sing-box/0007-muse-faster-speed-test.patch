@@ -1,0 +1,202 @@
+diff --git a/common/monitoring/muse_parallel.go b/common/monitoring/muse_parallel.go
+new file mode 100644
+index 00000000..3f51e8c7
+--- /dev/null
++++ b/common/monitoring/muse_parallel.go
+@@ -0,0 +1,87 @@
++package monitoring
++
++// muse (穿云 1.4.0): faster 测速 over dozens of nodes (Cloudflare 优选 lists of 50+ entries kept
++// many rows at 「测速中」 for a minute):
++//   - 16 test workers instead of 10 (the app can set 4–64);
++//   - a 测速 the user asked for is queued with priority, ahead of the periodic cycle;
++//   - after a lost warm-up probe the samples get a short timeout, so a dead node holds a worker
++//     about timeout + 3 s instead of twice the timeout;
++//   - the exit-IP lookup of a node runs after its delay was reported, off the test workers, at
++//     most museIpInfoParallel at a time.
++
++import (
++	"context"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing-box/hiddify/ipinfo"
++)
++
++const (
++	museIpInfoParallel     = 4
++	museLostWarmupMaxProbe = 3 * time.Second
++	museMinWorkers         = 4
++	museMaxWorkers         = 64
++)
++
++var (
++	museIpInfoSlots    = make(chan struct{}, museIpInfoParallel)
++	museIpInfoInFlight sync.Map // tag -> struct{}
++)
++
++// museLostWarmupTimeout is the sample timeout after the warm-up probe got no answer.
++func museLostWarmupTimeout(full time.Duration) time.Duration {
++	if full < museLostWarmupMaxProbe {
++		return full
++	}
++	return museLostWarmupMaxProbe
++}
++
++// MuseClampWorkers keeps a worker count the app sent within 4–64 (0 = default).
++func MuseClampWorkers(n int) int {
++	if n <= 0 {
++		return defaultWorkerCount
++	}
++	if n < museMinWorkers {
++		return museMinWorkers
++	}
++	if n > museMaxWorkers {
++		return museMaxWorkers
++	}
++	return n
++}
++
++// lookupIpInfoLater looks up the exit IP of [tag] in the background (once at a time per node).
++func (m *OutboundMonitoring) lookupIpInfoLater(tag string) {
++	if _, busy := museIpInfoInFlight.LoadOrStore(tag, struct{}{}); busy {
++		return
++	}
++	go func() {
++		defer museIpInfoInFlight.Delete(tag)
++		select {
++		case museIpInfoSlots <- struct{}{}:
++		case <-m.ctx.Done():
++			return
++		}
++		defer func() { <-museIpInfoSlots }()
++		state := m.getState(tag)
++		if state == nil {
++			return
++		}
++		ctx, cancel := context.WithTimeout(m.ctx, m.urlTestTimeout)
++		defer cancel()
++		newip, _, err := ipinfo.GetIpInfo(m.logger, ctx, state.outbound)
++		if err != nil || newip == nil {
++			return
++		}
++		state.mu.Lock()
++		state.history.IpInfo = mergeIpInfo(state.history.IpInfo, newip)
++		history := state.history
++		groups := state.groupTags
++		state.mu.Unlock()
++		m.history.StoreURLTestHistory(tag, &history)
++		m.cacheDirty.Store(true)
++		m.emitGroupEvent(groups)
++		m.logger.Info("outbound ", tag, " IP ", newip.IP)
++	}()
++}
+diff --git a/common/monitoring/muse_parallel_test.go b/common/monitoring/muse_parallel_test.go
+new file mode 100644
+index 00000000..091da1d5
+--- /dev/null
++++ b/common/monitoring/muse_parallel_test.go
+@@ -0,0 +1,24 @@
++package monitoring
++
++import (
++	"testing"
++	"time"
++)
++
++func TestMuseClampWorkers(t *testing.T) {
++	cases := map[int]int{0: 16, -1: 16, 1: 4, 16: 16, 32: 32, 500: 64}
++	for in, want := range cases {
++		if got := MuseClampWorkers(in); got != want {
++			t.Fatalf("MuseClampWorkers(%d) = %d, want %d", in, got, want)
++		}
++	}
++}
++
++func TestMuseLostWarmupTimeout(t *testing.T) {
++	if got := museLostWarmupTimeout(5 * time.Second); got != 3*time.Second {
++		t.Fatalf("got %v", got)
++	}
++	if got := museLostWarmupTimeout(2 * time.Second); got != 2*time.Second {
++		t.Fatalf("got %v", got)
++	}
++}
+diff --git a/common/monitoring/outbound_monitoring.go b/common/monitoring/outbound_monitoring.go
+index 99846fcc..27b2fa29 100644
+--- a/common/monitoring/outbound_monitoring.go
++++ b/common/monitoring/outbound_monitoring.go
+@@ -4,7 +4,6 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
+-	"fmt"
+ 	"net"
+ 	"sort"
+ 	"sync"
+@@ -35,7 +34,7 @@ var _ adapter.LifecycleService = (*OutboundMonitoring)(nil)
+ var _ adapter.InterfaceUpdateListener = (*OutboundMonitoring)(nil)
+ 
+ const (
+-	defaultWorkerCount    = 10
++	defaultWorkerCount    = 16 // muse (穿云 1.4.0): was 10; dozens of CF nodes queued too long
+ 	defaultDebounceWindow = 500 * time.Millisecond
+ 	defaultURLTestTimeout = 5 * time.Second
+ 	defaultIdleTimeout    = 10 * time.Minute
+@@ -222,9 +221,7 @@ func NewOutboundMonitoring(ctx context.Context, logger log.ContextLogger, option
+ 	if options.Interval <= 0 {
+ 		options.Interval = badoption.Duration(defaultInterval)
+ 	}
+-	if options.Workers <= 0 {
+-		options.Workers = defaultWorkerCount
+-	}
++	options.Workers = MuseClampWorkers(options.Workers)
+ 	if options.URLTestTimeout <= 0 {
+ 		options.URLTestTimeout = badoption.Duration(defaultURLTestTimeout)
+ 	}
+@@ -375,7 +372,8 @@ func (m *OutboundMonitoring) testNowThorough(outboundTag string, priority bool,
+ 	m.logger.Info("testing outbound ", outboundTag, " with priority: ", priority)
+ 	if grp, ok := m.reg().groups[outboundTag]; ok {
+ 		for tag := range grp.outbounds {
+-			m.testNowThorough(tag, false, thorough)
++			// muse (穿云 1.4.0): a 测速 the user asked for jumps ahead of the periodic cycle
++			m.testNowThorough(tag, priority || thorough, thorough)
+ 		}
+ 	} else {
+ 		state := m.getState(outboundTag)
+@@ -622,6 +620,10 @@ func (m *OutboundMonitoring) tester(parent context.Context, tag string, thorough
+ 		timeout := m.urlTestTimeout
+ 		if werr == nil {
+ 			timeout = museProbeTimeout(warm, m.urlTestTimeout)
++		} else {
++			// muse (穿云 1.4.0): the warm-up already waited the full timeout; the samples get the
++			// short one, so a dead node blocks a worker ~timeout+3 s instead of twice the timeout
++			timeout = museLostWarmupTimeout(m.urlTestTimeout)
+ 		}
+ 		delay, err = museProbeMedian(probe, timeout, museThoroughSamples)
+ 	} else {
+@@ -643,21 +645,11 @@ func (m *OutboundMonitoring) tester(parent context.Context, tag string, thorough
+ 	default:
+ 	}
+ 	if out.history.IpInfo == nil || out.from_cache {
+-
+-		ctx, cancel2 := context.WithTimeout(parent, m.urlTestTimeout)
+-		defer cancel2()
+-
+-		// muse: the IP lookup's own time no longer lowers the delay (it is not the same measure)
+-		newip, _, err := ipinfo.GetIpInfo(m.logger, ctx, out.outbound)
+-		if err == nil {
+-			his.IpInfo = mergeIpInfo(out.history.IpInfo, newip)
+-		}
+-	}
+-	if his.IpInfo != nil {
+-		m.logger.Info("outbound ", tag, " IP ", fmt.Sprint(his.IpInfo), " (", his.Delay, "ms): ", err)
+-	} else {
+-		m.logger.Info("outbound ", tag, " , IP: -          (", his.Delay, "ms)")
++		// muse (穿云 1.4.0): the IP lookup runs after the delay is reported and off the test
++		// workers (at most museIpInfoParallel at a time), so a slow lookup never holds the queue
++		m.lookupIpInfoLater(tag)
+ 	}
++	m.logger.Info("outbound ", tag, " (", his.Delay, "ms)")
+ 	return his, nil
+ }
+ 

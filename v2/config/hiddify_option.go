@@ -34,6 +34,9 @@ type HiddifyOptions struct {
 	// muse: 「我的宽带」 for Hysteria2 outbounds, Mbps; 0 = keep BBR (not overridable by subscriptions)
 	Hysteria2UpMbps   int `json:"hysteria2-up-mbps,omitempty"`
 	Hysteria2DownMbps int `json:"hysteria2-down-mbps,omitempty"`
+	// muse (穿云 1.4.0): 测速 workers (4–64, 0 = 16) and per-probe timeout in ms (0 = 5000)
+	MuseTestWorkers   int `json:"muse-test-workers,omitempty"`
+	MuseTestTimeoutMs int `json:"muse-test-timeout-ms,omitempty"`
 
 	DNSOptions
 	InboundOptions

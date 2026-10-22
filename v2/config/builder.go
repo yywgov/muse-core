@@ -369,6 +369,8 @@ func setExperimental(options *option.Options, hopt *HiddifyOptions) {
 			Interval:       badoption.Duration(hopt.URLTestInterval.Duration()),
 			DebounceWindow: badoption.Duration(time.Millisecond * 500),
 			IdleTimeout:    badoption.Duration(hopt.URLTestInterval.Duration().Nanoseconds() * 3),
+			Workers:        hopt.MuseTestWorkers,
+			URLTestTimeout: badoption.Duration(museTestTimeout(hopt.MuseTestTimeoutMs)),
 		},
 	}
 	if hopt.EnableClashApi {

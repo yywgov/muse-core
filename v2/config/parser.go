@@ -130,6 +130,8 @@ func parseConfigContent(ctx context.Context, content []byte, debug bool, configO
 		return patchConfigStr(ctx, output, "ClashParser", configOpt)
 	}
 
+	// 穿云 1.4.0: SplitHTTP is the old name of XHTTP
+	content = museSplitHTTPAlias(content)
 	v2ray, err := ray2sing.Ray2SingboxOptions(ctx, string(content), configOpt.UseXrayCoreWhenPossible)
 	if err == nil {
 		return patchConfigOptions(ctx, v2ray, "V2rayParser", configOpt)
