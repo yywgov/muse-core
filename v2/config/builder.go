@@ -86,6 +86,8 @@ func BuildConfig(ctx context.Context, hopts *HiddifyOptions, inputOpt *ReadOptio
 	if err := setOutbounds(&options, input, hopts, &staticIPs); err != nil {
 		return nil, err
 	}
+	// 穿云 1.4.0: custom hosts join the static DNS table
+	hostDomains := museAddHosts(hopts.MuseHosts, staticIPs)
 	if err := setDns(&options, hopts, &staticIPs); err != nil {
 		return nil, err
 	}
@@ -93,6 +95,7 @@ func BuildConfig(ctx context.Context, hopts *HiddifyOptions, inputOpt *ReadOptio
 	if err := setRoutingOptions(&options, hopts); err != nil {
 		return nil, err
 	}
+	museApplyExtras(&options, hopts, hostDomains)
 
 	return &options, nil
 }

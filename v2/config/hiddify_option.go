@@ -37,6 +37,9 @@ type HiddifyOptions struct {
 	// muse (穿云 1.4.0): 测速 workers (4–64, 0 = 16) and per-probe timeout in ms (0 = 5000)
 	MuseTestWorkers   int `json:"muse-test-workers,omitempty"`
 	MuseTestTimeoutMs int `json:"muse-test-timeout-ms,omitempty"`
+	// muse (穿云 1.4.0): custom hosts and sites / apps sent through one node (muse_extras.go)
+	MuseHosts     map[string]string `json:"muse-hosts,omitempty"`
+	MuseNodeRules []MuseNodeRule    `json:"muse-node-rules,omitempty"`
 
 	DNSOptions
 	InboundOptions
