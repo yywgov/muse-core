@@ -1,0 +1,180 @@
+穿云 core muse.15: REALITY keeps the post-quantum X25519MLKEM768 key share.
+Servers updated from Sep 2026 refuse a REALITY hello without it; servers that
+do not know the group just pick X25519. The auth key still comes from the plain
+X25519 share (or the X25519 half of the hybrid share when there is no plain one).
+
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index 24490d3b..04074132 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -30,7 +30,6 @@ import (
+ 	"github.com/sagernet/sing-box/adapter"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+-	"github.com/sagernet/sing/common"
+ 	"github.com/sagernet/sing/common/debug"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/logger"
+@@ -144,26 +143,12 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
+ 	uConn := utls.UClient(conn, uConfig, e.uClient.id)
+ 	verifier.UConn = uConn
++	// Keep the fingerprint's post-quantum X25519MLKEM768 key share: newer
++	// servers refuse a hello without it, older ones simply pick X25519.
+ 	err := uConn.BuildHandshakeState()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	for _, extension := range uConn.Extensions {
+-		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
+-			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
+-				return curveID != utls.X25519MLKEM768
+-			})
+-		}
+-		if ks, ok := extension.(*utls.KeyShareExtension); ok {
+-			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
+-				return share.Group != utls.X25519MLKEM768
+-			})
+-		}
+-	}
+-	err = uConn.BuildHandshakeState()
+-	if err != nil {
+-		return nil, err
+-	}
+ 
+ 	if len(uConfig.NextProtos) > 0 {
+ 		for _, extension := range uConn.Extensions {
+@@ -198,13 +183,9 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	keyShareKeys := uConn.HandshakeState.State13.KeyShareKeys
+-	if keyShareKeys == nil {
+-		return nil, E.New("nil KeyShareKeys")
+-	}
+-	ecdheKey := keyShareKeys.Ecdhe
+-	if ecdheKey == nil {
+-		return nil, E.New("nil ecdheKey")
++	ecdheKey, err := realityAuthECDHEKey(uConn.HandshakeState.State13.KeyShareKeys)
++	if err != nil {
++		return nil, err
+ 	}
+ 	authKey, err := ecdheKey.ECDH(publicKey)
+ 	if err != nil {
+@@ -348,3 +329,19 @@ func (c *realityClientConnWrapper) ReaderReplaceable() bool {
+ func (c *realityClientConnWrapper) WriterReplaceable() bool {
+ 	return false
+ }
++
++// realityAuthECDHEKey picks the X25519 private key the auth key is derived
++// from: the plain X25519 share when the hello carries one, otherwise the
++// X25519 half of the hybrid X25519MLKEM768 share.
++func realityAuthECDHEKey(keys *utls.KeySharePrivateKeys) (*ecdh.PrivateKey, error) {
++	if keys == nil {
++		return nil, E.New("nil KeyShareKeys")
++	}
++	if keys.Ecdhe != nil && keys.Ecdhe.Curve() == ecdh.X25519() {
++		return keys.Ecdhe, nil
++	}
++	if keys.MlkemEcdhe != nil {
++		return keys.MlkemEcdhe, nil
++	}
++	return nil, E.New("nil ecdheKey")
++}
+diff --git a/common/tls/muse_reality_pq_test.go b/common/tls/muse_reality_pq_test.go
+new file mode 100644
+index 00000000..b0d4999a
+--- /dev/null
++++ b/common/tls/muse_reality_pq_test.go
+@@ -0,0 +1,91 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"bytes"
++	"crypto/ecdh"
++	"net"
++	"testing"
++
++	utls "github.com/metacubex/utls"
++)
++
++func museRealityHello(t *testing.T, id utls.ClientHelloID) *utls.UConn {
++	t.Helper()
++	client, server := net.Pipe()
++	t.Cleanup(func() {
++		client.Close()
++		server.Close()
++	})
++	uConn := utls.UClient(client, &utls.Config{ServerName: "example.com", InsecureSkipVerify: true}, id)
++	if err := uConn.BuildHandshakeState(); err != nil {
++		t.Fatal(err)
++	}
++	return uConn
++}
++
++func museShares(uConn *utls.UConn) (curves []utls.CurveID, shares []utls.KeyShare) {
++	for _, extension := range uConn.Extensions {
++		switch ext := extension.(type) {
++		case *utls.SupportedCurvesExtension:
++			curves = ext.Curves
++		case *utls.KeyShareExtension:
++			shares = ext.KeyShares
++		}
++	}
++	return
++}
++
++// The REALITY hello keeps the post-quantum share and the auth key still comes
++// from the plain X25519 share the server reads.
++func TestMuseRealityHelloKeepsPostQuantumShare(t *testing.T) {
++	uConn := museRealityHello(t, utls.HelloChrome_Auto)
++	curves, shares := museShares(uConn)
++	hasCurve := false
++	for _, c := range curves {
++		if c == utls.X25519MLKEM768 {
++			hasCurve = true
++		}
++	}
++	if !hasCurve {
++		t.Fatalf("supported groups lack X25519MLKEM768: %v", curves)
++	}
++	var pq, plain []byte
++	for _, s := range shares {
++		switch s.Group {
++		case utls.X25519MLKEM768:
++			pq = s.Data
++		case utls.X25519:
++			plain = s.Data
++		}
++	}
++	if len(pq) != 1184+32 {
++		t.Fatalf("missing X25519MLKEM768 key share (len %d)", len(pq))
++	}
++	if !bytes.Contains(uConn.HandshakeState.Hello.Raw, pq) {
++		t.Fatal("X25519MLKEM768 key share not in the serialized hello")
++	}
++	key, err := realityAuthECDHEKey(uConn.HandshakeState.State13.KeyShareKeys)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if key.Curve() != ecdh.X25519() || !bytes.Equal(key.PublicKey().Bytes(), plain) {
++		t.Fatal("auth key does not match the X25519 key share")
++	}
++}
++
++func TestMuseRealityAuthKeyFromHybridOnly(t *testing.T) {
++	mlkemEcdhe, _ := ecdh.X25519().GenerateKey(bytes.NewReader(bytes.Repeat([]byte{1}, 64)))
++	p256, _ := ecdh.P256().GenerateKey(bytes.NewReader(bytes.Repeat([]byte{2}, 64)))
++	key, err := realityAuthECDHEKey(&utls.KeySharePrivateKeys{Ecdhe: p256, MlkemEcdhe: mlkemEcdhe})
++	if err != nil || key != mlkemEcdhe {
++		t.Fatalf("want hybrid X25519 key, got %v %v", key, err)
++	}
++	if _, err := realityAuthECDHEKey(nil); err == nil {
++		t.Fatal("nil keys accepted")
++	}
++	if _, err := realityAuthECDHEKey(&utls.KeySharePrivateKeys{Ecdhe: p256}); err == nil {
++		t.Fatal("P-256 only accepted")
++	}
++}
