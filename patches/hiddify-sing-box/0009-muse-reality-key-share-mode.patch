@@ -1,0 +1,881 @@
+穿云 core muse.16: REALITY picks its key share by fingerprint and retries once with the other one.
+Fixed modern fingerprints that pair X25519MLKEM768 natively (chrome) keep it;
+randomized and other specs send plain X25519 again (randomized specs could
+add the post-quantum share without listing the group, so about half the
+handshakes failed). The auth key always comes from the X25519 share.
+A failed REALITY handshake is redialed once with the other mode (vless
+direct, TLS dialer transports, xhttp); the mode that works is cached per
+server in memory. Paths without a redial switch the next connection.
+
+diff --git a/common/tls/client.go b/common/tls/client.go
+index 5bdce275..848d787b 100644
+--- a/common/tls/client.go
++++ b/common/tls/client.go
+@@ -156,7 +156,9 @@ func (d *defaultDialer) dialContext(ctx context.Context, destination M.Socksaddr
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	tlsConn, err := aTLS.ClientHandshake(ctx, conn, d.config)
++	tlsConn, err := realityHandshakeWithRetry(ctx, conn, d.config, func(ctx context.Context) (net.Conn, error) {
++		return d.dialer.DialContext(ctx, N.NetworkTCP, destination)
++	}, aTLS.ClientHandshake)
+ 	if err != nil {
+ 		conn.Close()
+ 		var echErr *tls.ECHRejectionError
+diff --git a/common/tls/muse_reality_mode.go b/common/tls/muse_reality_mode.go
+new file mode 100644
+index 00000000..67327e75
+--- /dev/null
++++ b/common/tls/muse_reality_mode.go
+@@ -0,0 +1,129 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"strings"
++
++	utls "github.com/metacubex/utls"
++)
++
++func realityModeKey(serverAddress string, uClient *UTLSClientConfig, publicKey, shortID string) string {
++	return strings.Join([]string{serverAddress, uClient.ServerName(), publicKey, shortID, uClient.id.Str()}, "|")
++}
++
++func realityRandomizedSpec(id utls.ClientHelloID) bool {
++	return strings.HasPrefix(id.Client, "Randomized")
++}
++
++func realityHelloGroups(uConn *utls.UConn) (curves *utls.SupportedCurvesExtension, keyShares *utls.KeyShareExtension) {
++	for _, extension := range uConn.Extensions {
++		switch ext := extension.(type) {
++		case *utls.SupportedCurvesExtension:
++			curves = ext
++		case *utls.KeyShareExtension:
++			keyShares = ext
++		}
++	}
++	return
++}
++
++func realityHasCurve(curves *utls.SupportedCurvesExtension, id utls.CurveID) bool {
++	if curves == nil {
++		return false
++	}
++	for _, c := range curves.Curves {
++		if c == id {
++			return true
++		}
++	}
++	return false
++}
++
++func realityHasKeyShare(keyShares *utls.KeyShareExtension, id utls.CurveID) bool {
++	if keyShares == nil {
++		return false
++	}
++	for _, s := range keyShares.KeyShares {
++		if s.Group == id {
++			return true
++		}
++	}
++	return false
++}
++
++// realityNativePostQuantum: the fingerprint is a fixed modern spec (not a
++// randomized one) whose own hello pairs X25519MLKEM768 in supported groups
++// and key shares.
++func realityNativePostQuantum(uConn *utls.UConn, id utls.ClientHelloID) bool {
++	if realityRandomizedSpec(id) {
++		return false
++	}
++	curves, keyShares := realityHelloGroups(uConn)
++	return realityHasCurve(curves, utls.X25519MLKEM768) && realityHasKeyShare(keyShares, utls.X25519MLKEM768)
++}
++
++// prepareRealityKeyShares shapes a built hello for the key share mode and
++// returns the mode actually used plus the other mode this fingerprint can
++// produce (realityModeAuto when there is none).
++//
++//   - post-quantum: the spec's own X25519MLKEM768 share is kept, with the
++//     group listed in supported groups so the pair matches.
++//   - X25519: X25519MLKEM768 is removed from supported groups and key shares.
++//
++// Either way the REALITY auth key comes from the X25519 share.
++func prepareRealityKeyShares(uConn *utls.UConn, id utls.ClientHelloID, mode realityKeyShareMode) (realityKeyShareMode, realityKeyShareMode, error) {
++	curves, keyShares := realityHelloGroups(uConn)
++	hasPQShare := realityHasKeyShare(keyShares, utls.X25519MLKEM768)
++	if mode == realityModeAuto {
++		if realityNativePostQuantum(uConn, id) {
++			mode = realityModePostQuantum
++		} else {
++			mode = realityModeX25519
++		}
++	}
++	if mode == realityModePostQuantum && !hasPQShare {
++		// This spec has no post-quantum share to send.
++		mode = realityModeX25519
++	}
++	if mode == realityModePostQuantum {
++		if curves != nil && !realityHasCurve(curves, utls.X25519MLKEM768) {
++			curves.Curves = append([]utls.CurveID{utls.X25519MLKEM768}, curves.Curves...)
++			if err := uConn.BuildHandshakeState(); err != nil {
++				return mode, realityModeAuto, err
++			}
++		}
++		return mode, realityModeX25519, nil
++	}
++	changed := false
++	if curves != nil && realityHasCurve(curves, utls.X25519MLKEM768) {
++		filtered := make([]utls.CurveID, 0, len(curves.Curves))
++		for _, c := range curves.Curves {
++			if c != utls.X25519MLKEM768 {
++				filtered = append(filtered, c)
++			}
++		}
++		curves.Curves = filtered
++		changed = true
++	}
++	if hasPQShare {
++		filtered := make([]utls.KeyShare, 0, len(keyShares.KeyShares))
++		for _, s := range keyShares.KeyShares {
++			if s.Group != utls.X25519MLKEM768 {
++				filtered = append(filtered, s)
++			}
++		}
++		keyShares.KeyShares = filtered
++		changed = true
++	}
++	if changed {
++		if err := uConn.BuildHandshakeState(); err != nil {
++			return mode, realityModeAuto, err
++		}
++	}
++	alternate := realityModeAuto
++	if hasPQShare {
++		alternate = realityModePostQuantum
++	}
++	return mode, alternate, nil
++}
+diff --git a/common/tls/muse_reality_mode_test.go b/common/tls/muse_reality_mode_test.go
+new file mode 100644
+index 00000000..37a0d75c
+--- /dev/null
++++ b/common/tls/muse_reality_mode_test.go
+@@ -0,0 +1,401 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"bytes"
++	"context"
++	"crypto/ecdh"
++	"encoding/base64"
++	"encoding/binary"
++	"errors"
++	"io"
++	"net"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/logger"
++
++	utls "github.com/metacubex/utls"
++)
++
++const museGroupPQ = uint16(utls.X25519MLKEM768)
++
++// museHelloGroups reads supported groups and key share groups from a
++// serialized ClientHello handshake message.
++func museHelloGroups(t *testing.T, raw []byte) (groups, shares []uint16) {
++	t.Helper()
++	if len(raw) < 4 || raw[0] != 1 {
++		t.Fatalf("not a ClientHello: % x", raw[:min(len(raw), 8)])
++	}
++	b := raw[4:]
++	b = b[2+32:]
++	b = b[1+int(b[0]):]
++	b = b[2+int(binary.BigEndian.Uint16(b)):]
++	b = b[1+int(b[0]):]
++	b = b[2:]
++	for len(b) >= 4 {
++		typ, l := binary.BigEndian.Uint16(b), int(binary.BigEndian.Uint16(b[2:]))
++		data := b[4 : 4+l]
++		b = b[4+l:]
++		switch typ {
++		case 10:
++			list := data[2:]
++			for i := 0; i+1 < len(list); i += 2 {
++				groups = append(groups, binary.BigEndian.Uint16(list[i:]))
++			}
++		case 51:
++			list := data[2:]
++			for len(list) >= 4 {
++				g, kl := binary.BigEndian.Uint16(list), int(binary.BigEndian.Uint16(list[2:]))
++				shares = append(shares, g)
++				list = list[4+kl:]
++			}
++		}
++	}
++	return
++}
++
++func museHas(list []uint16, v uint16) bool {
++	for _, x := range list {
++		if x == v {
++			return true
++		}
++	}
++	return false
++}
++
++func musePrepared(t *testing.T, id utls.ClientHelloID, mode realityKeyShareMode) (*utls.UConn, realityKeyShareMode, realityKeyShareMode) {
++	t.Helper()
++	client, server := net.Pipe()
++	t.Cleanup(func() {
++		client.Close()
++		server.Close()
++	})
++	uConn := utls.UClient(client, &utls.Config{ServerName: "example.com", InsecureSkipVerify: true}, id)
++	if err := uConn.BuildHandshakeState(); err != nil {
++		t.Fatal(err)
++	}
++	used, alternate, err := prepareRealityKeyShares(uConn, id, mode)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return uConn, used, alternate
++}
++
++// museCheckAuthKey: the auth key is the private key of the X25519 share in the hello.
++func museCheckAuthKey(t *testing.T, uConn *utls.UConn) {
++	t.Helper()
++	key, err := realityAuthECDHEKey(uConn.HandshakeState.State13.KeyShareKeys)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if key.Curve() != ecdh.X25519() {
++		t.Fatal("auth key is not X25519")
++	}
++	pub := key.PublicKey().Bytes()
++	for _, extension := range uConn.Extensions {
++		if ks, ok := extension.(*utls.KeyShareExtension); ok {
++			for _, s := range ks.KeyShares {
++				if s.Group == utls.X25519 && bytes.Equal(s.Data, pub) {
++					if !bytes.Contains(uConn.HandshakeState.Hello.Raw, pub) {
++						t.Fatal("X25519 share not in the serialized hello")
++					}
++					return
++				}
++				if s.Group == utls.X25519MLKEM768 && len(s.Data) == 1184+32 && bytes.Equal(s.Data[1184:], pub) {
++					return
++				}
++			}
++		}
++	}
++	t.Fatal("auth key does not match an X25519 key share in the hello")
++}
++
++func museCheckX25519Only(t *testing.T, uConn *utls.UConn) {
++	t.Helper()
++	groups, shares := museHelloGroups(t, uConn.HandshakeState.Hello.Raw)
++	if museHas(groups, museGroupPQ) || museHas(shares, museGroupPQ) {
++		t.Fatalf("X25519 mode hello still carries X25519MLKEM768: groups %x shares %x", groups, shares)
++	}
++	if !museHas(shares, uint16(utls.X25519)) {
++		t.Fatalf("X25519 mode hello lacks an X25519 share: %x", shares)
++	}
++	museCheckAuthKey(t, uConn)
++}
++
++func museCheckPaired(t *testing.T, uConn *utls.UConn) {
++	t.Helper()
++	groups, shares := museHelloGroups(t, uConn.HandshakeState.Hello.Raw)
++	if !museHas(groups, museGroupPQ) || !museHas(shares, museGroupPQ) {
++		t.Fatalf("post-quantum hello must list X25519MLKEM768 in groups and shares: groups %x shares %x", groups, shares)
++	}
++	for _, s := range shares {
++		if !museHas(groups, s) {
++			t.Fatalf("key share %x not in supported groups %x", s, groups)
++		}
++	}
++	museCheckAuthKey(t, uConn)
++}
++
++func TestMuseRealityModeChrome(t *testing.T) {
++	for _, name := range []string{"chrome", "edge", "random"} {
++		id, err := uTLSClientHelloID(name)
++		if err != nil {
++			t.Fatal(err)
++		}
++		uConn, used, alternate := musePrepared(t, id, realityModeAuto)
++		native := realityNativePostQuantum(uConn, id)
++		if name == "chrome" && (!native || used != realityModePostQuantum || alternate != realityModeX25519) {
++			t.Fatalf("chrome: native %v used %v alternate %v", native, used, alternate)
++		}
++		if used == realityModePostQuantum {
++			museCheckPaired(t, uConn)
++		} else {
++			museCheckX25519Only(t, uConn)
++		}
++	}
++	// The other mode of a chrome hello is plain X25519.
++	id, _ := uTLSClientHelloID("chrome")
++	uConn, used, alternate := musePrepared(t, id, realityModeX25519)
++	if used != realityModeX25519 || alternate != realityModePostQuantum {
++		t.Fatalf("chrome forced X25519: used %v alternate %v", used, alternate)
++	}
++	museCheckX25519Only(t, uConn)
++}
++
++func TestMuseRealityModeFirefox(t *testing.T) {
++	id, _ := uTLSClientHelloID("firefox")
++	uConn, used, alternate := musePrepared(t, id, realityModeAuto)
++	if used != realityModeX25519 {
++		t.Fatalf("firefox: used %v", used)
++	}
++	museCheckX25519Only(t, uConn)
++	if alternate == realityModePostQuantum {
++		pq, used, _ := musePrepared(t, id, realityModePostQuantum)
++		if used != realityModePostQuantum {
++			t.Fatalf("firefox retry: used %v", used)
++		}
++		museCheckPaired(t, pq)
++	}
++}
++
++func museRandomizedIDs(t *testing.T, base utls.ClientHelloID, n int) []utls.ClientHelloID {
++	weights := utls.DefaultWeights
++	weights.TLSVersMax_Set_VersionTLS13 = 1
++	weights.FirstKeyShare_Set_CurveP256 = 0
++	ids := make([]utls.ClientHelloID, 0, n)
++	for i := 0; i < n; i++ {
++		id := base
++		seed, err := utls.NewPRNGSeed()
++		if err != nil {
++			t.Fatal(err)
++		}
++		id.Seed = seed
++		id.Weights = &weights
++		ids = append(ids, id)
++	}
++	return ids
++}
++
++func museCheckRandomized(t *testing.T, ids []utls.ClientHelloID) {
++	t.Helper()
++	sawPQ := false
++	for _, id := range ids {
++		uConn, used, alternate := musePrepared(t, id, realityModeAuto)
++		if used != realityModeX25519 {
++			t.Fatalf("%s: randomized spec used %v", id.Str(), used)
++		}
++		museCheckX25519Only(t, uConn)
++		if alternate == realityModePostQuantum {
++			sawPQ = true
++			pq, used, alternate := musePrepared(t, id, realityModePostQuantum)
++			if used != realityModePostQuantum || alternate != realityModeX25519 {
++				t.Fatalf("%s retry: used %v alternate %v", id.Str(), used, alternate)
++			}
++			museCheckPaired(t, pq)
++		} else {
++			_, used, _ := musePrepared(t, id, realityModePostQuantum)
++			if used != realityModeX25519 {
++				t.Fatalf("%s without a post-quantum share must stay X25519, used %v", id.Str(), used)
++			}
++		}
++	}
++	if !sawPQ {
++		t.Log("no seed produced a post-quantum share")
++	}
++}
++
++func TestMuseRealityModeRandomized(t *testing.T) {
++	id, _ := uTLSClientHelloID("randomized")
++	museCheckRandomized(t, append([]utls.ClientHelloID{id}, museRandomizedIDs(t, utls.HelloRandomized, 48)...))
++}
++
++func TestMuseRealityModeRandomizedNoALPN(t *testing.T) {
++	museCheckRandomized(t, museRandomizedIDs(t, utls.HelloRandomizedNoALPN, 48))
++}
++
++func TestMuseRealityModeCache(t *testing.T) {
++	c := &realityModeCache{}
++	if c.preferred("a") != realityModeAuto {
++		t.Fatal("empty cache")
++	}
++	c.failed("a", realityModePostQuantum, realityModeX25519, true)
++	if c.preferred("a") != realityModeAuto {
++		t.Fatal("a failure with a retry pending must not change the mode")
++	}
++	c.succeeded("a", realityModeX25519)
++	if c.preferred("a") != realityModeX25519 || c.preferred("b") != realityModeAuto {
++		t.Fatal("working mode not cached per server")
++	}
++	c.failed("a", realityModeX25519, realityModePostQuantum, false)
++	if c.preferred("a") != realityModePostQuantum {
++		t.Fatal("a failure without retry should switch the next connection")
++	}
++	c.failed("a", realityModePostQuantum, realityModeAuto, false)
++	if c.preferred("a") != realityModePostQuantum {
++		t.Fatal("no alternate: keep mode")
++	}
++}
++
++// museFakeServer reads one ClientHello per connection, records its groups and
++// closes the connection, so every handshake fails after the hello is sent.
++type museFakeServer struct {
++	access sync.Mutex
++	hellos [][2][]uint16
++	wg     sync.WaitGroup
++}
++
++func (s *museFakeServer) dial(t *testing.T) net.Conn {
++	client, server := net.Pipe()
++	s.wg.Add(1)
++	go func() {
++		defer s.wg.Done()
++		defer server.Close()
++		header := make([]byte, 5)
++		if _, err := io.ReadFull(server, header); err != nil {
++			return
++		}
++		body := make([]byte, binary.BigEndian.Uint16(header[3:]))
++		if _, err := io.ReadFull(server, body); err != nil {
++			return
++		}
++		groups, shares := museHelloGroups(t, body)
++		s.access.Lock()
++		s.hellos = append(s.hellos, [2][]uint16{groups, shares})
++		s.access.Unlock()
++	}()
++	return client
++}
++
++func (s *museFakeServer) modes() []realityKeyShareMode {
++	s.wg.Wait()
++	s.access.Lock()
++	defer s.access.Unlock()
++	var modes []realityKeyShareMode
++	for _, h := range s.hellos {
++		if museHas(h[1], museGroupPQ) {
++			modes = append(modes, realityModePostQuantum)
++		} else {
++			modes = append(modes, realityModeX25519)
++		}
++	}
++	return modes
++}
++
++func museRealityConfig(t *testing.T, server, fingerprint string) *RealityClientConfig {
++	t.Helper()
++	key, err := ecdh.X25519().GenerateKey(bytes.NewReader(bytes.Repeat([]byte{7}, 64)))
++	if err != nil {
++		t.Fatal(err)
++	}
++	config, err := NewRealityClient(context.Background(), logger.NOP(), server, option.OutboundTLSOptions{
++		Enabled:    true,
++		ServerName: "www.example.com",
++		UTLS:       &option.OutboundUTLSOptions{Enabled: true, Fingerprint: fingerprint},
++		Reality: &option.OutboundRealityOptions{
++			Enabled:   true,
++			PublicKey: base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()),
++			ShortID:   "0123abcd",
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return config.(*RealityClientConfig)
++}
++
++func TestMuseRealityRetryOtherMode(t *testing.T) {
++	config := museRealityConfig(t, "retry-chrome.test", "chrome")
++	fake := &museFakeServer{}
++	redials := 0
++	_, err := ClientHandshakeRedial(context.Background(), fake.dial(t), config, func(ctx context.Context) (net.Conn, error) {
++		redials++
++		return fake.dial(t), nil
++	})
++	if err == nil || !strings.Contains(err.Error(), "retry") {
++		t.Fatalf("want a failed retry, got %v", err)
++	}
++	modes := fake.modes()
++	if redials != 1 || len(modes) != 2 || modes[0] != realityModePostQuantum || modes[1] != realityModeX25519 {
++		t.Fatalf("want one retry PQ -> X25519, got redials %d hellos %v", redials, modes)
++	}
++	if got := realityModes.preferred(config.modeKey); got != realityModeAuto {
++		t.Fatalf("both modes failed: cache must stay unset, got %v", got)
++	}
++
++	// A server known to work with X25519 starts there and retries with PQ.
++	realityModes.succeeded(config.modeKey, realityModeX25519)
++	fake = &museFakeServer{}
++	_, err = ClientHandshakeRedial(context.Background(), fake.dial(t), config, func(ctx context.Context) (net.Conn, error) {
++		return fake.dial(t), nil
++	})
++	if err == nil {
++		t.Fatal("fake server cannot finish a handshake")
++	}
++	modes = fake.modes()
++	if len(modes) != 2 || modes[0] != realityModeX25519 || modes[1] != realityModePostQuantum {
++		t.Fatalf("cached X25519: want X25519 -> PQ, got %v", modes)
++	}
++}
++
++func TestMuseRealityRetryNoAlternate(t *testing.T) {
++	config := museRealityConfig(t, "retry-firefox.test", "firefox")
++	fake := &museFakeServer{}
++	redials := 0
++	_, err := ClientHandshakeRedial(context.Background(), fake.dial(t), config, func(ctx context.Context) (net.Conn, error) {
++		redials++
++		return fake.dial(t), nil
++	})
++	if err == nil {
++		t.Fatal("fake server cannot finish a handshake")
++	}
++	var hsErr *realityHandshakeError
++	if !errors.As(err, &hsErr) {
++		t.Fatalf("want a REALITY handshake error, got %T %v", err, err)
++	}
++	modes := fake.modes()
++	if hsErr.alternate == realityModeAuto && (redials != 0 || len(modes) != 1 || modes[0] != realityModeX25519) {
++		t.Fatalf("firefox without a post-quantum share: no retry expected, got redials %d hellos %v", redials, modes)
++	}
++}
++
++// Paths without a redial (one connection only) switch the next connection's mode.
++func TestMuseRealityRetryNextConnection(t *testing.T) {
++	config := museRealityConfig(t, "next-chrome.test", "chrome")
++	fake := &museFakeServer{}
++	for i := 0; i < 3; i++ {
++		if _, err := ClientHandshake(context.Background(), fake.dial(t), config); err == nil {
++			t.Fatal("fake server cannot finish a handshake")
++		}
++	}
++	modes := fake.modes()
++	want := []realityKeyShareMode{realityModePostQuantum, realityModeX25519, realityModePostQuantum}
++	for i := range want {
++		if len(modes) != 3 || modes[i] != want[i] {
++			t.Fatalf("want %v, got %v", want, modes)
++		}
++	}
++}
+diff --git a/common/tls/muse_reality_retry.go b/common/tls/muse_reality_retry.go
+new file mode 100644
+index 00000000..e6c2bf46
+--- /dev/null
++++ b/common/tls/muse_reality_retry.go
+@@ -0,0 +1,130 @@
++package tls
++
++import (
++	"context"
++	"errors"
++	"net"
++	"sync"
++
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// realityKeyShareMode is which key share a REALITY hello carries.
++type realityKeyShareMode uint8
++
++const (
++	// realityModeAuto: post-quantum when the fingerprint carries it natively, X25519 otherwise.
++	realityModeAuto realityKeyShareMode = iota
++	// realityModePostQuantum: X25519MLKEM768 next to the plain X25519 share.
++	realityModePostQuantum
++	// realityModeX25519: plain X25519 only.
++	realityModeX25519
++)
++
++func (m realityKeyShareMode) String() string {
++	switch m {
++	case realityModePostQuantum:
++		return "X25519MLKEM768"
++	case realityModeX25519:
++		return "X25519"
++	default:
++		return "auto"
++	}
++}
++
++// realityHandshakeError is a REALITY handshake that reached the server and
++// failed. alternate is the other key share mode worth one retry
++// (realityModeAuto when the fingerprint cannot produce another mode).
++type realityHandshakeError struct {
++	alternate realityKeyShareMode
++	err       error
++}
++
++func (e *realityHandshakeError) Error() string { return e.err.Error() }
++func (e *realityHandshakeError) Unwrap() error { return e.err }
++
++// realityModeCache remembers, in memory, the key share mode that last worked
++// for each REALITY server.
++type realityModeCache struct {
++	access sync.Mutex
++	modes  map[string]realityKeyShareMode
++}
++
++var realityModes = &realityModeCache{}
++
++func (c *realityModeCache) preferred(key string) realityKeyShareMode {
++	c.access.Lock()
++	defer c.access.Unlock()
++	return c.modes[key]
++}
++
++func (c *realityModeCache) succeeded(key string, mode realityKeyShareMode) {
++	if mode == realityModeAuto {
++		return
++	}
++	c.access.Lock()
++	defer c.access.Unlock()
++	if c.modes == nil {
++		c.modes = make(map[string]realityKeyShareMode)
++	}
++	c.modes[key] = mode
++}
++
++// failed is called after a failed handshake. Without a retry on a fresh
++// connection following, the next connection starts with the other mode.
++func (c *realityModeCache) failed(key string, used, alternate realityKeyShareMode, retryPending bool) {
++	if retryPending || alternate == realityModeAuto || alternate == used {
++		return
++	}
++	c.succeeded(key, alternate)
++}
++
++type (
++	realityModeContextKey  struct{}
++	realityRetryContextKey struct{}
++)
++
++func realityModeFromContext(ctx context.Context) (realityKeyShareMode, bool) {
++	mode, ok := ctx.Value(realityModeContextKey{}).(realityKeyShareMode)
++	return mode, ok
++}
++
++func realityRetryPending(ctx context.Context) bool {
++	pending, _ := ctx.Value(realityRetryContextKey{}).(bool)
++	return pending
++}
++
++// ClientHandshakeRedial is ClientHandshake, plus: when a REALITY handshake
++// fails, it dials once more and retries with the other key share mode
++// (post-quantum ⇄ X25519). The mode that works is remembered per server.
++func ClientHandshakeRedial(ctx context.Context, conn net.Conn, config Config, redial func(ctx context.Context) (net.Conn, error)) (Conn, error) {
++	return realityHandshakeWithRetry(ctx, conn, config, redial, ClientHandshake)
++}
++
++type realityHandshakeFunc func(ctx context.Context, conn net.Conn, config Config) (Conn, error)
++
++func realityHandshakeWithRetry(ctx context.Context, conn net.Conn, config Config, redial func(ctx context.Context) (net.Conn, error), handshake realityHandshakeFunc) (Conn, error) {
++	if redial == nil {
++		return handshake(ctx, conn, config)
++	}
++	retryCtx := context.WithValue(ctx, realityRetryContextKey{}, true)
++	tlsConn, err := handshake(retryCtx, conn, config)
++	if err == nil {
++		return tlsConn, nil
++	}
++	var hsErr *realityHandshakeError
++	if !errors.As(err, &hsErr) || hsErr.alternate == realityModeAuto || ctx.Err() != nil {
++		return nil, err
++	}
++	conn.Close()
++	retryConn, dialErr := redial(ctx)
++	if dialErr != nil {
++		return nil, err
++	}
++	tlsConn, retryErr := handshake(context.WithValue(retryCtx, realityModeContextKey{}, hsErr.alternate), retryConn, config)
++	if retryErr != nil {
++		retryConn.Close()
++		return nil, E.Cause(retryErr, "reality retry with ", hsErr.alternate.String(), " key share (first attempt: ", err.Error(), ")")
++	}
++	return tlsConn, nil
++}
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index 04074132..fdc94c72 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -17,6 +17,7 @@ import (
+ 	"encoding/base64"
+ 	"encoding/binary"
+ 	"encoding/hex"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	mRand "math/rand"
+@@ -48,6 +49,8 @@ type RealityClientConfig struct {
+ 	uClient   *UTLSClientConfig
+ 	publicKey []byte
+ 	shortID   [8]byte
++	// modeKey names this server for the in-memory key share mode cache.
++	modeKey string
+ }
+ 
+ func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
+@@ -86,7 +89,8 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
+ 		return nil, E.New("invalid short_id")
+ 	}
+ 
+-	var config Config = &RealityClientConfig{ctx, uClient.(*UTLSClientConfig), publicKey, shortID}
++	realityUClient := uClient.(*UTLSClientConfig)
++	var config Config = &RealityClientConfig{ctx, realityUClient, publicKey, shortID, realityModeKey(serverAddress, realityUClient, options.Reality.PublicKey, options.Reality.ShortID)}
+ 	if options.KernelRx || options.KernelTx {
+ 		if !C.IsLinux {
+ 			return nil, E.New("kTLS is only supported on Linux")
+@@ -134,6 +138,24 @@ func (e *RealityClientConfig) Client(conn net.Conn) (Conn, error) {
+ }
+ 
+ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) (aTLS.Conn, error) {
++	mode, forced := realityModeFromContext(ctx)
++	if !forced {
++		mode = realityModes.preferred(e.modeKey)
++	}
++	tlsConn, used, alternate, err := e.clientHandshake(ctx, conn, mode)
++	if err != nil {
++		var hsErr *realityHandshakeError
++		if errors.As(err, &hsErr) {
++			hsErr.alternate = alternate
++			realityModes.failed(e.modeKey, used, alternate, realityRetryPending(ctx))
++		}
++		return nil, err
++	}
++	realityModes.succeeded(e.modeKey, used)
++	return tlsConn, nil
++}
++
++func (e *RealityClientConfig) clientHandshake(ctx context.Context, conn net.Conn, mode realityKeyShareMode) (aTLS.Conn, realityKeyShareMode, realityKeyShareMode, error) {
+ 	verifier := &realityVerifier{
+ 		serverName: e.uClient.ServerName(),
+ 	}
+@@ -143,11 +165,13 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
+ 	uConn := utls.UClient(conn, uConfig, e.uClient.id)
+ 	verifier.UConn = uConn
+-	// Keep the fingerprint's post-quantum X25519MLKEM768 key share: newer
+-	// servers refuse a hello without it, older ones simply pick X25519.
+ 	err := uConn.BuildHandshakeState()
+ 	if err != nil {
+-		return nil, err
++		return nil, mode, realityModeAuto, err
++	}
++	mode, alternate, err := prepareRealityKeyShares(uConn, e.uClient.id, mode)
++	if err != nil {
++		return nil, mode, realityModeAuto, err
+ 	}
+ 
+ 	if len(uConfig.NextProtos) > 0 {
+@@ -181,23 +205,23 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	}
+ 	publicKey, err := ecdh.X25519().NewPublicKey(e.publicKey)
+ 	if err != nil {
+-		return nil, err
++		return nil, mode, alternate, err
+ 	}
+ 	ecdheKey, err := realityAuthECDHEKey(uConn.HandshakeState.State13.KeyShareKeys)
+ 	if err != nil {
+-		return nil, err
++		return nil, mode, alternate, err
+ 	}
+ 	authKey, err := ecdheKey.ECDH(publicKey)
+ 	if err != nil {
+-		return nil, err
++		return nil, mode, alternate, err
+ 	}
+ 	if authKey == nil {
+-		return nil, E.New("nil auth_key")
++		return nil, mode, alternate, E.New("nil auth_key")
+ 	}
+ 	verifier.authKey = authKey
+ 	_, err = hkdf.New(sha256.New, authKey, hello.Random[:20], []byte("REALITY")).Read(authKey)
+ 	if err != nil {
+-		return nil, err
++		return nil, mode, alternate, err
+ 	}
+ 	aesBlock, _ := aes.NewCipher(authKey)
+ 	aesGcmCipher, _ := cipher.NewGCM(aesBlock)
+@@ -210,7 +234,7 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 
+ 	err = uConn.HandshakeContext(ctx)
+ 	if err != nil {
+-		return nil, err
++		return nil, mode, alternate, &realityHandshakeError{err: err}
+ 	}
+ 
+ 	if debug.Enabled {
+@@ -219,10 +243,10 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 
+ 	if !verifier.verified {
+ 		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
+-		return nil, E.New("reality verification failed")
++		return nil, mode, alternate, &realityHandshakeError{err: E.New("reality verification failed")}
+ 	}
+ 
+-	return &realityClientConnWrapper{uConn}, nil
++	return &realityClientConnWrapper{uConn}, mode, alternate, nil
+ }
+ 
+ func realityClientFallback(ctx context.Context, uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) {
+@@ -255,6 +279,7 @@ func (e *RealityClientConfig) Clone() Config {
+ 		e.uClient.Clone().(*UTLSClientConfig),
+ 		e.publicKey,
+ 		e.shortID,
++		e.modeKey,
+ 	}
+ }
+ 
+diff --git a/protocol/vless/outbound.go b/protocol/vless/outbound.go
+index 0157f77e..b80f4e19 100644
+--- a/protocol/vless/outbound.go
++++ b/protocol/vless/outbound.go
+@@ -225,7 +225,7 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
+ 	} else {
+ 		conn, err = h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
+ 		if err == nil && h.tlsConfig != nil {
+-			conn, err = tls.ClientHandshake(ctx, conn, h.tlsConfig)
++			conn, err = tls.ClientHandshakeRedial(ctx, conn, h.tlsConfig, h.redialServer)
+ 			if err == nil && h.vision && baseConn == nil {
+ 				baseConn = conn
+ 			}
+@@ -318,7 +318,7 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
+ 	} else {
+ 		conn, err = h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
+ 		if err == nil && h.tlsConfig != nil {
+-			conn, err = tls.ClientHandshake(ctx, conn, h.tlsConfig)
++			conn, err = tls.ClientHandshakeRedial(ctx, conn, h.tlsConfig, h.redialServer)
+ 		}
+ 	}
+ 	if err != nil {
+@@ -497,3 +497,9 @@ func parseClientEncryption(raw string) (clientEncryptionConfig, error) {
+ 	}
+ 	return cfg, nil
+ }
++
++// redialServer opens a fresh TCP connection to the server, for one REALITY
++// retry with the other key share mode.
++func (h *vlessDialer) redialServer(ctx context.Context) (net.Conn, error) {
++	return h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
++}
+diff --git a/transport/v2rayxhttp/client.go b/transport/v2rayxhttp/client.go
+index f510057a..2e9e6b3d 100644
+--- a/transport/v2rayxhttp/client.go
++++ b/transport/v2rayxhttp/client.go
+@@ -292,7 +292,9 @@ func createHTTPClient(dest M.Socksaddr, dialer N.Dialer, options *option.V2RayXH
+ 			return nil, err
+ 		}
+ 		if httpVersion != "3" && tlsConfig != nil {
+-			return tls.ClientHandshake(ctxInner, conn, tlsConfig)
++			return tls.ClientHandshakeRedial(ctxInner, conn, tlsConfig, func(ctx context.Context) (net.Conn, error) {
++				return dialer.DialContext(ctx, "tcp", dest)
++			})
+ 		}
+ 		return conn, nil
+ 	}

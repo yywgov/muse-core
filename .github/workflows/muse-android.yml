@@ -58,8 +58,13 @@ jobs:
         run: |
           go test -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_utls,with_clash_api ./common/monitoring/ ./protocol/group/balancer/ -count=1 -v 2>&1 | grep -E '^(=== RUN|--- |PASS|FAIL|ok|panic)|_test.go|muse timing'
           test ${PIPESTATUS[0]} -eq 0
-          # 穿云 core muse.15: REALITY hello keeps the post-quantum key share (patch 0008)
-          go test -ldflags=-checklinkname=0 -tags with_utls ./common/tls/ -run 'MuseReality' -count=1 -v
+          # 穿云 core muse.15/16: REALITY key share by fingerprint (chrome PQ, firefox/randomized X25519)
+          # + one retry with the other mode, cached per server (patches 0008, 0009)
+          go test -ldflags=-checklinkname=0 -tags with_utls ./common/tls/ -run 'MuseReality' -count=1 -v 2>&1 | tee /tmp/muse-reality.log
+          test ${PIPESTATUS[0]} -eq 0
+          for t in ModeChrome ModeFirefox ModeRandomized ModeRandomizedNoALPN ModeCache RetryOtherMode RetryNoAlternate RetryNextConnection; do
+            grep -q -- "--- PASS: TestMuseReality$t " /tmp/muse-reality.log || { echo "::error::TestMuseReality$t did not run/pass"; exit 1; }
+          done
 
       - uses: actions/setup-java@v5
         with:
