@@ -118,9 +118,23 @@ jobs:
 
       # same toolchain as upstream build.yml (hiddify-lib-windows-amd64)
       - name: Setup MinGW
+        id: mingw
         uses: egor-tensin/setup-mingw@v2
+        timeout-minutes: 8
+        continue-on-error: true
         with:
           platform: x64
+
+      # muse.15 tag run hung 45+ min inside the step above; retry with plain apt under a time cap
+      - name: Setup MinGW (fallback)
+        if: steps.mingw.outcome != 'success'
+        timeout-minutes: 15
+        run: |
+          for i in 1 2 3; do
+            sudo timeout 300 apt-get update -q && sudo timeout 400 apt-get install -y -q mingw-w64 && break
+            echo "::warning::mingw install attempt $i failed"; sleep 10
+          done
+          x86_64-w64-mingw32-gcc --version
 
       - name: Build Windows library + CLI
         run: make windows-amd64
