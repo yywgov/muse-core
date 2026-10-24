@@ -1,0 +1,213 @@
+穿云 core muse.17: REALITY sends client version 26.10.21 in the session ID.
+The first three plaintext session ID bytes are the client version; servers can
+refuse versions below a configured (or release-default 26.3.27) minimum, and
+the old 1.8.1 was below it. The version is one constant
+(realityClientVersion in muse_reality_version.go).
+
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index fdc94c72..0c1eb93f 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -195,11 +195,7 @@ func (e *RealityClientConfig) clientHandshake(ctx context.Context, conn net.Conn
+ 	}
+ 	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowTime.Unix()))
+ 
+-	hello.SessionId[0] = 1
+-	hello.SessionId[1] = 8
+-	hello.SessionId[2] = 1
+-	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
+-	copy(hello.SessionId[8:], e.shortID[:])
++	realityWriteSessionHeader(hello.SessionId, uint32(time.Now().Unix()), e.shortID)
+ 	if debug.Enabled {
+ 		fmt.Printf("REALITY hello.sessionId[:16]: %v\n", hello.SessionId[:16])
+ 	}
+diff --git a/common/tls/muse_reality_version.go b/common/tls/muse_reality_version.go
+new file mode 100644
+index 00000000..9d81a4e5
+--- /dev/null
++++ b/common/tls/muse_reality_version.go
+@@ -0,0 +1,23 @@
++//go:build with_utls
++
++package tls
++
++// realityClientVersion is the client version a REALITY ClientHello carries in
++// the first three bytes of its session ID (major, minor, patch). Servers can
++// refuse versions outside their configured minimum/maximum, and some releases
++// default the minimum to 26.3.27, so keep this at or above current servers.
++// Bump it here only.
++var realityClientVersion = [3]byte{26, 10, 21}
++
++// realityWriteSessionHeader fills the plaintext REALITY session ID header:
++// version (3 bytes), a reserved zero byte, the Unix time (4 bytes, big
++// endian) and the short ID (8 bytes).
++func realityWriteSessionHeader(sessionID []byte, unix uint32, shortID [8]byte) {
++	copy(sessionID[:3], realityClientVersion[:])
++	sessionID[3] = 0
++	sessionID[4] = byte(unix >> 24)
++	sessionID[5] = byte(unix >> 16)
++	sessionID[6] = byte(unix >> 8)
++	sessionID[7] = byte(unix)
++	copy(sessionID[8:16], shortID[:])
++}
+diff --git a/common/tls/muse_reality_version_test.go b/common/tls/muse_reality_version_test.go
+new file mode 100644
+index 00000000..67abc142
+--- /dev/null
++++ b/common/tls/muse_reality_version_test.go
+@@ -0,0 +1,155 @@
++//go:build with_utls
++
++package tls
++
++import (
++	"bytes"
++	"context"
++	"crypto/aes"
++	"crypto/cipher"
++	"crypto/ecdh"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/binary"
++	"io"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/logger"
++
++	"golang.org/x/crypto/hkdf"
++)
++
++// The session ID header carries version 26.10.21, a zero reserved byte, the
++// time and the short ID.
++func TestMuseRealityVersionBytes(t *testing.T) {
++	if realityClientVersion != [3]byte{26, 10, 21} {
++		t.Fatalf("client version %v, want 26.10.21", realityClientVersion)
++	}
++	sid := make([]byte, 32)
++	for i := range sid {
++		sid[i] = 0xff
++	}
++	realityWriteSessionHeader(sid, 0x6a0b0c0d, [8]byte{1, 2, 3, 4})
++	want := []byte{26, 10, 21, 0, 0x6a, 0x0b, 0x0c, 0x0d, 1, 2, 3, 4, 0, 0, 0, 0}
++	if !bytes.Equal(sid[:16], want) {
++		t.Fatalf("session header %v, want %v", sid[:16], want)
++	}
++	// A server comparing three big-endian bytes against a minimum of 26.3.27
++	// accepts this version.
++	value := func(b []byte) int { return int(b[0])<<16 | int(b[1])<<8 | int(b[2]) }
++	if value(sid[:3]) < value([]byte{26, 3, 27}) {
++		t.Fatal("version below 26.3.27")
++	}
++}
++
++// museX25519Share returns the plain X25519 key share of a ClientHello
++// handshake message.
++func museX25519Share(t *testing.T, raw []byte) []byte {
++	t.Helper()
++	p := 4 + 2 + 32
++	p += 1 + int(raw[p])
++	p += 2 + int(binary.BigEndian.Uint16(raw[p:]))
++	p += 1 + int(raw[p])
++	end := p + 2 + int(binary.BigEndian.Uint16(raw[p:]))
++	for p += 2; p+4 <= end; {
++		typ := binary.BigEndian.Uint16(raw[p:])
++		l := int(binary.BigEndian.Uint16(raw[p+2:]))
++		data := raw[p+4 : p+4+l]
++		p += 4 + l
++		if typ != 0x0033 {
++			continue
++		}
++		for q := 2; q+4 <= len(data); {
++			group := binary.BigEndian.Uint16(data[q:])
++			kl := int(binary.BigEndian.Uint16(data[q+2:]))
++			if group == 0x001d {
++				return data[q+4 : q+4+kl]
++			}
++			q += 4 + kl
++		}
++	}
++	t.Fatal("no X25519 key share")
++	return nil
++}
++
++// The real handshake's encrypted session ID decrypts, with the server key, to
++// version 26.10.21, the current time and the configured short ID.
++func TestMuseRealityVersionInHello(t *testing.T) {
++	serverKey, err := ecdh.X25519().NewPrivateKey(bytes.Repeat([]byte{9}, 32))
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, fp := range []string{"chrome", "firefox"} {
++		c, err := NewRealityClient(context.Background(), logger.NOP(), "198.51.100.1:443", option.OutboundTLSOptions{
++			Enabled:    true,
++			ServerName: "www.example.com",
++			UTLS:       &option.OutboundUTLSOptions{Enabled: true, Fingerprint: fp},
++			Reality: &option.OutboundRealityOptions{
++				Enabled:   true,
++				PublicKey: base64.RawURLEncoding.EncodeToString(serverKey.PublicKey().Bytes()),
++				ShortID:   "0123abcd",
++			},
++		})
++		if err != nil {
++			t.Fatal(err)
++		}
++		config := c.(*RealityClientConfig)
++		client, server := net.Pipe()
++		helloCh := make(chan []byte, 1)
++		go func() {
++			defer server.Close()
++			header := make([]byte, 5)
++			if _, err := io.ReadFull(server, header); err != nil {
++				helloCh <- nil
++				return
++			}
++			body := make([]byte, binary.BigEndian.Uint16(header[3:]))
++			if _, err := io.ReadFull(server, body); err != nil {
++				helloCh <- nil
++				return
++			}
++			helloCh <- body
++		}()
++		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		_, _, _, _ = config.clientHandshake(ctx, client, realityModeAuto)
++		cancel()
++		client.Close()
++		raw := <-helloCh
++		if raw == nil {
++			t.Fatalf("%s: no ClientHello", fp)
++		}
++		sid := append([]byte(nil), raw[39:71]...)
++		aad := append([]byte(nil), raw...)
++		copy(aad[39:71], make([]byte, 32))
++		random := raw[6:38]
++		peer, err := ecdh.X25519().NewPublicKey(museX25519Share(t, raw))
++		if err != nil {
++			t.Fatal(err)
++		}
++		authKey, err := serverKey.ECDH(peer)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if _, err = hkdf.New(sha256.New, authKey, random[:20], []byte("REALITY")).Read(authKey); err != nil {
++			t.Fatal(err)
++		}
++		block, _ := aes.NewCipher(authKey)
++		aead, _ := cipher.NewGCM(block)
++		plain, err := aead.Open(nil, random[20:], sid, aad)
++		if err != nil {
++			t.Fatalf("%s: session ID does not decrypt: %v", fp, err)
++		}
++		if !bytes.Equal(plain[:4], []byte{26, 10, 21, 0}) {
++			t.Fatalf("%s: version bytes %v, want [26 10 21 0]", fp, plain[:4])
++		}
++		if !bytes.Equal(plain[8:16], []byte{0x01, 0x23, 0xab, 0xcd, 0, 0, 0, 0}) {
++			t.Fatalf("%s: short ID %x", fp, plain[8:16])
++		}
++		if d := time.Since(time.Unix(int64(binary.BigEndian.Uint32(plain[4:8])), 0)); d < -time.Minute || d > time.Minute {
++			t.Fatalf("%s: time off by %v", fp, d)
++		}
++	}
++}

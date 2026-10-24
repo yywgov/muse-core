@@ -60,9 +60,10 @@ jobs:
           test ${PIPESTATUS[0]} -eq 0
           # 穿云 core muse.15/16: REALITY key share by fingerprint (chrome PQ, firefox/randomized X25519)
           # + one retry with the other mode, cached per server (patches 0008, 0009)
+          # 穿云 core muse.17: client version 26.10.21 in the session ID (patch 0010)
           go test -ldflags=-checklinkname=0 -tags with_utls ./common/tls/ -run 'MuseReality' -count=1 -v 2>&1 | tee /tmp/muse-reality.log
           test ${PIPESTATUS[0]} -eq 0
-          for t in ModeChrome ModeFirefox ModeRandomized ModeRandomizedNoALPN ModeCache RetryOtherMode RetryNoAlternate RetryNextConnection; do
+          for t in ModeChrome ModeFirefox ModeRandomized ModeRandomizedNoALPN ModeCache RetryOtherMode RetryNoAlternate RetryNextConnection VersionBytes VersionInHello; do
             grep -q -- "--- PASS: TestMuseReality$t " /tmp/muse-reality.log || { echo "::error::TestMuseReality$t did not run/pass"; exit 1; }
           done
 
