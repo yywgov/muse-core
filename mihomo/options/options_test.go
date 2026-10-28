@@ -187,3 +187,33 @@ func TestBuildAllUnsupportedFailsClosed(t *testing.T) {
 		t.Error("nil profile must fail")
 	}
 }
+
+// Windows: the TUN adapter gets the app's name; an Android fd TUN never gets a device name.
+func TestBuildTunDevice(t *testing.T) {
+	p, err := profile.Parse([]byte("trojan://pw@a.example.com:443#A\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := Defaults()
+	s.EnableTun = true
+	get := func(rt Runtime) map[string]any {
+		buf, err := Build(p, s, rt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := yaml.Unmarshal(buf, &m); err != nil {
+			t.Fatal(err)
+		}
+		return m["tun"].(map[string]any)
+	}
+	if tun := get(Runtime{TunDevice: "Chuanyun"}); tun["device"] != "Chuanyun" || tun["auto-route"] != true {
+		t.Fatalf("windows tun %v", tun)
+	}
+	if tun := get(Runtime{}); tun["device"] != nil {
+		t.Fatalf("default tun %v", tun)
+	}
+	if tun := get(Runtime{TunDevice: "Chuanyun", TunFD: 7}); tun["device"] != nil || tun["file-descriptor"] != 7 {
+		t.Fatalf("fd tun %v", tun)
+	}
+}

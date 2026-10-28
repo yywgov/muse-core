@@ -148,6 +148,8 @@ type Runtime struct {
 	// Android: the VPN service's TUN file descriptor (the service builds the TUN and routes; the
 	// core only reads and writes packets). 0 elsewhere.
 	TunFD int
+	// Windows: name of the TUN adapter the core creates ("" = engine default)
+	TunDevice string
 }
 
 // mihomo log levels: debug, info, warning, error, silent
@@ -247,6 +249,9 @@ func Build(p *profile.Profile, s Settings, rt Runtime) ([]byte, error) {
 			"auto-detect-interface": true,
 			"strict-route":          s.StrictRoute,
 			"dns-hijack":            []any{"any:53"},
+		}
+		if rt.TunDevice != "" && rt.TunFD == 0 {
+			cfg["tun"].(map[string]any)["device"] = rt.TunDevice
 		}
 		if rt.TunFD > 0 {
 			tun := cfg["tun"].(map[string]any)

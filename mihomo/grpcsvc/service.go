@@ -98,6 +98,9 @@ type Service struct {
 	tunFD atomic.Int32
 }
 
+// TunAdapterName names the Windows TUN adapter (and, in package engine, its description).
+const TunAdapterName = "Chuanyun"
+
 // SetTunFD hands the core the TUN the Android VPN service built (0: none).
 func (s *Service) SetTunFD(fd int) { s.tunFD.Store(int32(fd)) }
 
@@ -330,6 +333,9 @@ var proxyErr = regexp.MustCompile(`^proxy (\d+): (.*)$`)
 // the whole profile.
 func (s *Service) buildAndParse(p *profile.Profile) (any, error) {
 	rt := options.Runtime{TunFD: int(s.tunFD.Load())}
+	if runtime.GOOS == "windows" {
+		rt.TunDevice = TunAdapterName
+	}
 	if s.settings.EnableClashAPI {
 		port := s.settings.ClashAPIPort
 		if port == 0 {
