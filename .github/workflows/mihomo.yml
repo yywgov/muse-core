@@ -121,9 +121,12 @@ jobs:
         working-directory: bin
         run: |
           ls -la
-          x86_64-w64-mingw32-objdump -p muse-mihomo.dll > /tmp/exports.txt
+          x86_64-w64-mingw32-objdump -p muse-mihomo.dll | tr -d '\r' > /tmp/pe.txt
+          sed -n '/Ordinal\/Name Pointer/,/^$/p' /tmp/pe.txt > /tmp/exports.txt
+          [ -s /tmp/exports.txt ] || cp /tmp/pe.txt /tmp/exports.txt
+          cat /tmp/exports.txt
           for f in setup start stop restart freeString cleanup closeGrpc; do
-            grep -qE "\]\s+$f$" /tmp/exports.txt || { echo "::error::muse-mihomo.dll does not export $f"; exit 1; }
+            grep -qw -- "$f" /tmp/exports.txt || { echo "::error::muse-mihomo.dll does not export $f"; exit 1; }
           done
           b=$(stat -c %s muse-mihomo.dll); g=$(gzip -9 -c muse-mihomo.dll | wc -c)
           echo "### muse-mihomo.dll: $b bytes ($(echo "$b/1000000" | bc -l | cut -c1-5) MB, gzip $(echo "$g/1000000" | bc -l | cut -c1-5) MB)" | tee -a "$GITHUB_STEP_SUMMARY"
