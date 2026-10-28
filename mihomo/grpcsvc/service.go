@@ -24,6 +24,7 @@ import (
 	"github.com/yywgov/muse-core/mihomo/hcorepb/hcore"
 	"github.com/yywgov/muse-core/mihomo/options"
 	"github.com/yywgov/muse-core/mihomo/profile"
+	"github.com/yywgov/muse-core/mihomo/sysproxy"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -87,6 +88,43 @@ type Service struct {
 	SystemInfoInterval time.Duration
 	// StateResync is how often a status listener re-checks the last state it sent.
 	StateResync time.Duration
+
+	// SysProxy points the system proxy at the mixed port in 系统代理 mode (Windows).
+	SysProxy  sysproxy.Setter
+	proxyOn   bool
+	proxyPort uint16
+
+	// tunFD: Android VPN service's TUN (SetTunFD); 0 = the core makes its own TUN
+	tunFD atomic.Int32
+}
+
+// SetTunFD hands the core the TUN the Android VPN service built (0: none).
+func (s *Service) SetTunFD(fd int) { s.tunFD.Store(int32(fd)) }
+
+// syncSystemProxy sets / blanks the system proxy for the current state (call with s.mu held).
+func (s *Service) syncSystemProxy(running bool) {
+	if s.SysProxy == nil {
+		return
+	}
+	want := running && s.settings.SetSystemProxy && !s.settings.EnableTun
+	if want {
+		if s.proxyOn && s.proxyPort == s.settings.MixedPort {
+			return
+		}
+		if err := s.SysProxy.Set(s.settings.MixedPort); err != nil {
+			s.log(hcore.LogLevel_WARNING, "system proxy: "+err.Error())
+			return
+		}
+		s.proxyOn, s.proxyPort = true, s.settings.MixedPort
+		return
+	}
+	if !s.proxyOn {
+		return
+	}
+	if err := s.SysProxy.Clear(); err != nil {
+		s.log(hcore.LogLevel_WARNING, "system proxy: "+err.Error())
+	}
+	s.proxyOn = false
 }
 
 // New returns a stopped service.
@@ -101,6 +139,7 @@ func New(eng Engine) *Service {
 		nodesHub:           newHub[bool](),
 		testing:            map[string]bool{},
 		GroupsDebounce:     time.Second,
+		SysProxy:           sysproxy.Default,
 	}
 	return s
 }
@@ -254,6 +293,7 @@ func (s *Service) startLocked(in *hcore.StartRequest) *hcore.CoreInfoResponse {
 	s.logUnsupported(p)
 	s.eng.Apply(parsed)
 	s.adopt(in, p)
+	s.syncSystemProxy(true)
 	return s.setState(hcore.CoreStates_STARTED, hcore.MessageType_EMPTY, "")
 }
 
@@ -289,7 +329,7 @@ var proxyErr = regexp.MustCompile(`^proxy (\d+): (.*)$`)
 // ("proxy N: ...") is moved to Unsupported and the config rebuilt, so one bad node does not stop
 // the whole profile.
 func (s *Service) buildAndParse(p *profile.Profile) (any, error) {
-	rt := options.Runtime{}
+	rt := options.Runtime{TunFD: int(s.tunFD.Load())}
 	if s.settings.EnableClashAPI {
 		port := s.settings.ClashAPIPort
 		if port == 0 {
@@ -331,6 +371,7 @@ func (s *Service) StopCore() *hcore.CoreInfoResponse {
 		return s.setState(hcore.CoreStates_STOPPED, hcore.MessageType_ALREADY_STOPPED, "")
 	}
 	s.setState(hcore.CoreStates_STOPPING, hcore.MessageType_EMPTY, "")
+	s.syncSystemProxy(false)
 	s.eng.Stop()
 	s.profile = nil
 	s.nodesHub.publish(false)

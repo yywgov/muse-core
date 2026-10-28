@@ -340,6 +340,7 @@ func (s *Service) HotReloadCore(in *hcore.StartRequest) *hcore.CoreInfoResponse 
 		_ = s.eng.Select(g, sel) // a node that left the profile keeps the group's default
 	}
 	s.adopt(in, p)
+	s.syncSystemProxy(true)
 	return s.setState(hcore.CoreStates_STARTED, hcore.MessageType_EMPTY, "")
 }
 

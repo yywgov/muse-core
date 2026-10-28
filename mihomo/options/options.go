@@ -38,6 +38,7 @@ type Settings struct {
 	TestURLs        []string `json:"connection-test-urls"`
 	TestIntervalSec int64    `json:"-"`
 	EnableTun       bool     `json:"enable-tun"`
+	SetSystemProxy  bool     `json:"set-system-proxy"` // Windows 系统代理 mode (package sysproxy)
 	TunStack        string   `json:"tun-implementation"`
 	MTU             uint32   `json:"mtu"`
 	StrictRoute     bool     `json:"strict-route"`
@@ -144,6 +145,9 @@ type Runtime struct {
 	ControllerAddr string
 	Secret         string
 	HomeDir        string
+	// Android: the VPN service's TUN file descriptor (the service builds the TUN and routes; the
+	// core only reads and writes packets). 0 elsewhere.
+	TunFD int
 }
 
 // mihomo log levels: debug, info, warning, error, silent
@@ -243,6 +247,14 @@ func Build(p *profile.Profile, s Settings, rt Runtime) ([]byte, error) {
 			"auto-detect-interface": true,
 			"strict-route":          s.StrictRoute,
 			"dns-hijack":            []any{"any:53"},
+		}
+		if rt.TunFD > 0 {
+			tun := cfg["tun"].(map[string]any)
+			tun["file-descriptor"] = rt.TunFD
+			// routes, interface and per-app rules belong to the VPN service that made the TUN
+			tun["auto-route"] = false
+			tun["auto-detect-interface"] = false
+			delete(tun, "strict-route")
 		}
 	}
 
