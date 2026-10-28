@@ -1,7 +1,9 @@
 // Package grpcsvc serves the app's core control API (proto package "hcore", the same service the
 // main core serves) on top of a mihomo engine. Block M1 implements Setup, Start, Stop, the
 // status stream (CoreInfoListener), GetSystemInfo / GetSystemInfoStream, LogListener, settings
-// (the settings call) and Close; the other calls answer Unimplemented until their block.
+// (the settings call) and Close; block M2 adds the node groups (OutboundsInfo, MainOutboundsInfo),
+// SelectOutbound, UrlTest / UrlTestActive, HotReload and Restart (groups.go). Other calls answer
+// Unimplemented until their block.
 package grpcsvc
 
 import (
@@ -42,6 +44,12 @@ type Engine interface {
 	Current(group string) string
 	SubscribeLogs() (<-chan LogEvent, func())
 	Version() string
+
+	// block M2: groups, selection, delay tests, hot reload
+	Nodes() map[string]NodeInfo
+	Select(group, name string) error
+	TestDelay(ctx context.Context, name, url string, timeout time.Duration) (uint16, error)
+	Reload(parsed any)
 }
 
 // Service implements hcore.CoreServer.
@@ -62,6 +70,15 @@ type Service struct {
 	logHub   *hub[*hcore.LogMessage]
 	logStop  func()
 
+	running    options.Settings // settings the running config was built with
+	groupOrder []string
+	nodesHub   *hub[bool] // true: the node list changed; false: the core stopped
+	testMu     sync.Mutex
+	testing    map[string]bool
+
+	// GroupsDebounce batches node-list changes (delay results arrive one by one), like the main core.
+	GroupsDebounce time.Duration
+
 	srvMu   sync.Mutex
 	servers map[hcore.SetupMode]*grpc.Server
 	addrs   map[hcore.SetupMode]string
@@ -81,6 +98,9 @@ func New(eng Engine) *Service {
 		logHub:             newHub[*hcore.LogMessage](),
 		SystemInfoInterval: time.Second,
 		StateResync:        2 * time.Second,
+		nodesHub:           newHub[bool](),
+		testing:            map[string]bool{},
+		GroupsDebounce:     time.Second,
 	}
 	return s
 }
@@ -184,10 +204,11 @@ func (s *Service) StartService(ctx context.Context, in *hcore.StartRequest) (*hc
 func (s *Service) StartCore(in *hcore.StartRequest) *hcore.CoreInfoResponse {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st := s.State(); st != hcore.CoreStates_STOPPED {
-		return &hcore.CoreInfoResponse{CoreState: st, MessageType: hcore.MessageType_ALREADY_STARTED, Message: "instance already started"}
-	}
-	s.setState(hcore.CoreStates_STARTING, hcore.MessageType_EMPTY, "")
+	return s.startLocked(in)
+}
+
+// loadProfile resolves the request (or the last one) to a parsed profile.
+func (s *Service) loadProfile(in *hcore.StartRequest) (*hcore.StartRequest, *profile.Profile, hcore.MessageType, error) {
 	if in == nil {
 		in = &hcore.StartRequest{}
 	}
@@ -202,33 +223,64 @@ func (s *Service) StartCore(in *hcore.StartRequest) *hcore.CoreInfoResponse {
 	content := []byte(in.ConfigContent)
 	if len(content) == 0 {
 		if in.ConfigPath == "" {
-			return s.setState(hcore.CoreStates_STOPPED, hcore.MessageType_EMPTY_CONFIGURATION, "no profile")
+			return in, nil, hcore.MessageType_EMPTY_CONFIGURATION, errors.New("no profile")
 		}
 		b, err := os.ReadFile(in.ConfigPath)
 		if err != nil {
-			return s.setState(hcore.CoreStates_STOPPED, hcore.MessageType_ERROR_READING_CONFIG, err.Error())
+			return in, nil, hcore.MessageType_ERROR_READING_CONFIG, err
 		}
 		content = b
 	}
 	p, err := profile.Parse(content)
 	if err != nil {
-		return s.setState(hcore.CoreStates_STOPPED, hcore.MessageType_ERROR_PARSING_CONFIG, err.Error())
+		return in, nil, hcore.MessageType_ERROR_PARSING_CONFIG, err
+	}
+	return in, p, hcore.MessageType_EMPTY, nil
+}
+
+func (s *Service) startLocked(in *hcore.StartRequest) *hcore.CoreInfoResponse {
+	if st := s.State(); st != hcore.CoreStates_STOPPED {
+		return &hcore.CoreInfoResponse{CoreState: st, MessageType: hcore.MessageType_ALREADY_STARTED, Message: "instance already started"}
+	}
+	s.setState(hcore.CoreStates_STARTING, hcore.MessageType_EMPTY, "")
+	in, p, mt, err := s.loadProfile(in)
+	if err != nil {
+		return s.setState(hcore.CoreStates_STOPPED, mt, err.Error())
 	}
 	parsed, err := s.buildAndParse(p)
 	if err != nil {
 		return s.setState(hcore.CoreStates_STOPPED, hcore.MessageType_ERROR_BUILDING_CONFIG, err.Error())
 	}
+	s.logUnsupported(p)
+	s.eng.Apply(parsed)
+	s.adopt(in, p)
+	return s.setState(hcore.CoreStates_STARTED, hcore.MessageType_EMPTY, "")
+}
+
+func (s *Service) logUnsupported(p *profile.Profile) {
 	for _, u := range p.Unsupported {
 		s.log(hcore.LogLevel_WARNING, fmt.Sprintf("node unavailable on this core: %q (%s, %s) %s", u.Name, u.Type, u.Reason, u.Detail))
 	}
-	s.eng.Apply(parsed)
-	s.profile, s.name = p, in.ConfigName
+}
+
+// adopt records the running profile and request (and saves the request for a start without one).
+func (s *Service) adopt(in *hcore.StartRequest, p *profile.Profile) {
+	s.profile, s.name, s.running = p, in.ConfigName, s.settings
+	order := []string{options.GroupSelect, options.GroupAuto}
+	seen := map[string]bool{options.GroupSelect: true, options.GroupAuto: true}
+	for _, g := range p.Groups {
+		if n, ok := g["name"].(string); ok && !seen[n] {
+			seen[n] = true
+			order = append(order, n)
+		}
+	}
+	s.groupOrder = order
 	if s.workDir != "" && (in.ConfigPath != "" || in.ConfigContent != "") {
 		if b, err := json.Marshal(lastStart{Path: in.ConfigPath, Content: in.ConfigContent, Name: in.ConfigName}); err == nil {
 			_ = os.WriteFile(s.lastStartPath(), b, 0o600)
 		}
 	}
-	return s.setState(hcore.CoreStates_STARTED, hcore.MessageType_EMPTY, "")
+	s.nodesHub.publish(true)
 }
 
 var proxyErr = regexp.MustCompile(`^proxy (\d+): (.*)$`)
@@ -281,6 +333,7 @@ func (s *Service) StopCore() *hcore.CoreInfoResponse {
 	s.setState(hcore.CoreStates_STOPPING, hcore.MessageType_EMPTY, "")
 	s.eng.Stop()
 	s.profile = nil
+	s.nodesHub.publish(false)
 	return s.setState(hcore.CoreStates_STOPPED, hcore.MessageType_EMPTY, "")
 }
 

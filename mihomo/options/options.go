@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/yywgov/muse-core/mihomo/profile"
 	"go.yaml.in/yaml/v3"
@@ -41,6 +42,48 @@ type Settings struct {
 	MTU             uint32   `json:"mtu"`
 	StrictRoute     bool     `json:"strict-route"`
 	BypassLAN       bool     `json:"bypass-lan"`
+	TestWorkers     int      `json:"muse-test-workers"`    // 4–64, 0 = 16 (same as the main core)
+	TestTimeoutMs   int      `json:"muse-test-timeout-ms"` // 0 = 5000
+}
+
+// Workers is the number of delay tests run at once.
+func (s Settings) Workers() int {
+	switch {
+	case s.TestWorkers <= 0:
+		return 16
+	case s.TestWorkers < 4:
+		return 4
+	case s.TestWorkers > 64:
+		return 64
+	}
+	return s.TestWorkers
+}
+
+// TestTimeout is the limit of one delay test.
+func (s Settings) TestTimeout() time.Duration {
+	if s.TestTimeoutMs <= 0 {
+		return 5 * time.Second
+	}
+	return time.Duration(s.TestTimeoutMs) * time.Millisecond
+}
+
+// URL is the delay-test URL.
+func (s Settings) URL() string {
+	if s.TestURL != "" {
+		return s.TestURL
+	}
+	if len(s.TestURLs) > 0 && s.TestURLs[0] != "" {
+		return s.TestURLs[0]
+	}
+	return Defaults().TestURL
+}
+
+// SameTun reports whether two settings give the same TUN (a changed TUN cannot be hot reloaded).
+func (s Settings) SameTun(o Settings) bool {
+	if !s.EnableTun && !o.EnableTun {
+		return true
+	}
+	return s.EnableTun == o.EnableTun && tunStack(s.TunStack) == tunStack(o.TunStack) && s.MTU == o.MTU && s.StrictRoute == o.StrictRoute
 }
 
 // Defaults match the main core's defaults for the same keys.
@@ -222,13 +265,7 @@ func Build(p *profile.Profile, s Settings, rt Runtime) ([]byte, error) {
 		cfg["sub-rules"] = p.SubRules
 	}
 
-	testURL := s.TestURL
-	if testURL == "" && len(s.TestURLs) > 0 {
-		testURL = s.TestURLs[0]
-	}
-	if testURL == "" {
-		testURL = Defaults().TestURL
-	}
+	testURL := s.URL()
 	interval := s.TestIntervalSec
 	if interval <= 0 {
 		interval = Defaults().TestIntervalSec

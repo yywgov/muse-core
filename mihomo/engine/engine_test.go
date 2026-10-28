@@ -3,6 +3,7 @@ package engine
 import (
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"strconv"
 	"strings"
@@ -165,4 +166,72 @@ func TestServiceStartStopRealEngine(t *testing.T) {
 	waitUntil(t, "mixed port again", func() bool { return listening(mixed) })
 	svc.StopCore()
 	waitUntil(t, "mixed port closed again", func() bool { return !listening(mixed) })
+}
+
+// Groups, selection, delay tests and hot reload against the real engine, offline: a "direct"
+// node reaches a local HTTP server, a node at a closed local port fails.
+func TestGroupsSelectTestReloadRealEngine(t *testing.T) {
+	web := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	defer web.Close()
+	m := &Mihomo{}
+	svc := grpcsvc.New(m)
+	svc.Prepare(t.TempDir())
+	mixed := freePort(t)
+	js := `{"mixed-port":` + strconv.Itoa(mixed) + `,"connection-test-url":"` + web.URL + `/204","muse-test-timeout-ms":2000}`
+	if _, err := svc.ChangeHiddifySettings(t.Context(), &hcore.ChangeHiddifySettingsRequest{HiddifySettingsJson: js}); err != nil {
+		t.Fatal(err)
+	}
+	sub := "proxies:\n  - {name: D, type: direct}\n  - {name: X, type: trojan, server: 127.0.0.1, port: 1, password: pw}\n"
+	if res := svc.StartCore(&hcore.StartRequest{ConfigContent: sub}); res.CoreState != hcore.CoreStates_STARTED {
+		t.Fatalf("start %v", res)
+	}
+	defer svc.StopCore()
+	list := svc.GroupList(false)
+	if len(list.Items) != 2 || list.Items[0].Tag != options.GroupSelect || list.Items[1].Tag != options.GroupAuto {
+		t.Fatalf("groups %v", list.Items)
+	}
+	var names []string
+	for _, it := range list.Items[0].Items {
+		names = append(names, it.Tag+"/"+it.Type)
+	}
+	if strings.Join(names, ",") != "lowest/URLTest,D/Direct,X/Trojan" {
+		t.Errorf("select items %v", names)
+	}
+	if list.Items[1].Type != "urltest" || !list.Items[0].Selectable {
+		t.Errorf("types %v %v", list.Items[1].Type, list.Items[0].Selectable)
+	}
+
+	if r, err := svc.SelectOutbound(t.Context(), &hcore.SelectOutboundRequest{GroupTag: "select", OutboundTag: "X"}); err != nil || r.Code != 0 {
+		t.Fatalf("select %v %v", r, err)
+	}
+	if _, err := svc.SelectOutbound(t.Context(), &hcore.SelectOutboundRequest{GroupTag: "lowest", OutboundTag: "X"}); err == nil {
+		t.Error("url-test group must not be selectable")
+	}
+
+	if d, err := m.TestDelay(t.Context(), "D", web.URL+"/204", 2*time.Second); err != nil || d == 0 {
+		t.Fatalf("direct delay %d %v", d, err)
+	}
+	if _, err := svc.UrlTest(t.Context(), &hcore.UrlTestRequest{Tag: "X"}); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "X tested", func() bool { return m.Nodes()["X"].Delay != 0 && !svc.Testing() })
+	nodes := m.Nodes()
+	if nodes["X"].Delay != grpcsvc.DelayFailed || nodes["D"].Delay == 0 || nodes["D"].Delay == grpcsvc.DelayFailed {
+		t.Errorf("delays D=%d X=%d", nodes["D"].Delay, nodes["X"].Delay)
+	}
+
+	// hot reload: a new node, the selection and the mixed port stay
+	sub2 := sub + "  - {name: Y, type: direct}\n"
+	if r := svc.HotReloadCore(&hcore.StartRequest{ConfigContent: sub2}); r.CoreState != hcore.CoreStates_STARTED || r.MessageType != hcore.MessageType_EMPTY {
+		t.Fatalf("reload %v", r)
+	}
+	if now := m.Nodes()["select"].Now; now != "X" {
+		t.Errorf("selection after reload %q", now)
+	}
+	if _, ok := m.Nodes()["Y"]; !ok {
+		t.Error("new node missing")
+	}
+	if !listening(mixed) {
+		t.Error("mixed port closed by hot reload")
+	}
 }

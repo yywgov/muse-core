@@ -51,9 +51,16 @@ jobs:
           for t in GeneratedCopiesInSync ClashYAMLKeepsSupportedAndMarksTheRest ClashYAMLDropsReferencesFailClosed URIListBase64 \
                    BuildURIListDefaults BuildSettingsMapping BuildClashYAMLKeepsOwnGroupsAndRules BuildAllUnsupportedFailsClosed \
                    StartStopStates RejectedNodeIsMarkedAndRestRuns SettingsPersistAndLastStart GRPCServerTokenAndCalls \
-                   BuiltConfigsParseInMihomo RefusedProxyErrorNamesIndex ServiceStartStopRealEngine; do
+                   BuiltConfigsParseInMihomo RefusedProxyErrorNamesIndex ServiceStartStopRealEngine \
+                   SingBoxJSONMatchesShareLinks SingBoxMappingTable SingBoxUnsupportedKeptWithReason SingBoxJSONShapes \
+                   GroupListFull GroupListMainOnly SelectOutbound UrlTest GroupsStream HotReload \
+                   GroupsSelectTestReloadRealEngine; do
             grep -q -- "--- PASS: Test$t " /tmp/mihomo-test.log || { echo "::error::Test$t did not run/pass"; exit 1; }
           done
+
+      # the service runs streams, tests and reloads concurrently
+      - name: Race detector (service, profile, options)
+        run: go test -race -tags "$MIHOMO_TAGS" ./grpcsvc/ ./profile/ ./options/ -count=1
 
       - name: Build size (trimmed, -s -w, uncompressed)
         run: |

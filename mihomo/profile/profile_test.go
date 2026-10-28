@@ -150,8 +150,11 @@ func TestURIListPlainAndInvalid(t *testing.T) {
 }
 
 func TestOtherFormats(t *testing.T) {
-	if p, err := Parse([]byte(` {"outbounds":[{"type":"vless","tag":"a"}]}`)); !errors.Is(err, ErrSingBoxJSON) || p.Kind != KindSingBoxJSON {
-		t.Errorf("sing-box JSON: %v %v", p, err)
+	if _, err := Parse([]byte(` {"outbounds":[{"type":"selector","tag":"select"}]}`)); !errors.Is(err, ErrEmpty) {
+		t.Errorf("groups only: %v", err)
+	}
+	if _, err := Parse([]byte(`{bad json`)); err == nil {
+		t.Error("bad JSON must fail")
 	}
 	if _, err := Parse([]byte("\xef\xbb\xbf  \n")); !errors.Is(err, ErrEmpty) {
 		t.Errorf("empty: %v", err)

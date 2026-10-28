@@ -1,0 +1,7 @@
+vless://11111111-2222-3333-4444-555555555555@a.example.com:443?encryption=none&security=reality&sni=www.apple.com&fp=chrome&pbk=PUBKEY123&sid=ab12&flow=xtls-rprx-vision&type=tcp#vless-reality
+vless://11111111-2222-3333-4444-555555555555@b.example.com:443?encryption=none&security=tls&sni=b.example.com&type=ws&path=%2Fws&host=cdn.example.com#vless-ws
+vless://11111111-2222-3333-4444-555555555555@c.example.com:443?encryption=none&security=tls&sni=c.example.com&type=grpc&serviceName=gsvc#vless-grpc
+trojan://pw@d.example.com:443?sni=d.example.com&allowInsecure=1#trojan
+hysteria2://pw@e.example.com:443?sni=e.example.com&obfs=salamander&obfs-password=op#hy2
+tuic://11111111-2222-3333-4444-555555555555:pw@f.example.com:443?congestion_control=bbr&alpn=h3&sni=f.example.com#tuic
+anytls://pw@g.example.com:443?sni=g.example.com#anytls

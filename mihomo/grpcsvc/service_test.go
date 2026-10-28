@@ -31,6 +31,10 @@ type fakeEngine struct {
 	parseErr error
 	logs     chan LogEvent
 	cancels  int
+	nodes    map[string]NodeInfo
+	tested   []string
+	reloads  int
+	testGate chan struct{} // when set, TestDelay waits on it
 }
 
 func newFake() *fakeEngine { return &fakeEngine{logs: make(chan LogEvent, 8)} }
@@ -59,6 +63,49 @@ func (f *fakeEngine) SubscribeLogs() (<-chan LogEvent, func()) {
 	return f.logs, func() { f.mu.Lock(); f.cancels++; f.mu.Unlock() }
 }
 func (f *fakeEngine) Version() string { return "test" }
+
+func (f *fakeEngine) Nodes() map[string]NodeInfo {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]NodeInfo{}
+	for k, v := range f.nodes {
+		v.Members = append([]string(nil), v.Members...)
+		out[k] = v
+	}
+	return out
+}
+func (f *fakeEngine) Select(group, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	g, ok := f.nodes[group]
+	if !ok {
+		return errors.New("selector not found: " + group)
+	}
+	if g.GroupType != "selector" {
+		return errors.New("outbound is not a selector")
+	}
+	for _, m := range g.Members {
+		if m == name {
+			g.Now = name
+			f.nodes[group] = g
+			return nil
+		}
+	}
+	return errors.New("proxy not exist")
+}
+func (f *fakeEngine) TestDelay(ctx context.Context, name, url string, timeout time.Duration) (uint16, error) {
+	if f.testGate != nil {
+		<-f.testGate
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tested = append(f.tested, name+"@"+url)
+	n := f.nodes[name]
+	n.Delay, n.Tested = uint16(100+len(f.tested)), time.Unix(1700000000, 0)
+	f.nodes[name] = n
+	return n.Delay, nil
+}
+func (f *fakeEngine) Reload(any) { f.mu.Lock(); f.reloads++; f.mu.Unlock() }
 
 func (f *fakeEngine) lastConfig(t *testing.T) map[string]any {
 	t.Helper()
@@ -336,8 +383,8 @@ func TestGRPCServerTokenAndCalls(t *testing.T) {
 	waitFor(t, func() bool { return s.logHub.count() == 0 && s.stateHub.count() == 0 })
 
 	// calls of later blocks answer Unimplemented
-	if _, err := core.SelectOutbound(ctx, &hcore.SelectOutboundRequest{}); status.Code(err) != codes.Unimplemented {
-		t.Errorf("SelectOutbound: %v", err)
+	if _, err := core.GenerateWarpConfig(ctx, &hcore.GenerateWarpConfigRequest{}); status.Code(err) != codes.Unimplemented {
+		t.Errorf("GenerateWarpConfig: %v", err)
 	}
 }
 

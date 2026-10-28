@@ -22,8 +22,7 @@ const (
 	KindUnknown Kind = iota
 	KindClashYAML
 	KindURIList
-	// KindSingBoxJSON is the main core's own JSON (outbounds); mapped to mihomo proxies by
-	// package singbox (block M2), not here.
+	// KindSingBoxJSON is the main core's own JSON (outbounds/endpoints), see singbox.go.
 	KindSingBoxJSON
 )
 
@@ -66,9 +65,6 @@ type Profile struct {
 	Unsupported   []Unsupported
 }
 
-// ErrSingBoxJSON is returned for the main core's JSON format; package singbox maps it.
-var ErrSingBoxJSON = errors.New("profile: sing-box JSON is mapped by package singbox")
-
 // ErrEmpty is returned when the subscription holds no node at all (supported or not).
 var ErrEmpty = errors.New("profile: no nodes found")
 
@@ -102,8 +98,13 @@ func Parse(content []byte) (*Profile, error) {
 	if len(trimmed) == 0 {
 		return nil, ErrEmpty
 	}
-	if trimmed[0] == '{' || trimmed[0] == '[' {
-		return &Profile{Kind: KindSingBoxJSON}, ErrSingBoxJSON
+	if j := trimmed; j[0] == '{' || j[0] == '[' || bytes.HasPrefix(j, []byte("//")) || bytes.HasPrefix(j, []byte("/*")) {
+		if j[0] == '/' {
+			j = bytes.TrimSpace(stripJSONComments(j))
+		}
+		if len(j) > 0 && (j[0] == '{' || j[0] == '[') {
+			return parseSingBoxJSON(j)
+		}
 	}
 	if p, ok, err := parseClashYAML(trimmed); ok {
 		return p, err

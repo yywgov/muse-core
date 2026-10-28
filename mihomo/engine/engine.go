@@ -20,8 +20,9 @@ import (
 
 // Mihomo is the real engine. The zero value is ready; only one may be used per process.
 type Mihomo struct {
-	mu      sync.Mutex
-	running bool
+	mu         sync.Mutex
+	running    bool
+	controller string // address + secret of the local API last applied
 }
 
 // stopped config: no listener, no TUN, nothing to route
@@ -46,6 +47,7 @@ func (m *Mihomo) Apply(parsed any) {
 	tunnel.OnRunning()
 	hub.ApplyConfig(cfg)
 	m.running = true
+	m.controller = cfg.Controller.ExternalController + "\x00" + cfg.Controller.Secret
 }
 
 // Stop closes listeners, TUN, the local API and every open connection.
@@ -56,6 +58,7 @@ func (m *Mihomo) Stop() {
 		return
 	}
 	m.running = false
+	m.controller = ""
 	route.ReCreateServer(&route.Config{})
 	if cfg, err := executor.ParseWithBytes([]byte(idleConfig)); err == nil {
 		executor.ApplyConfig(cfg, true)
