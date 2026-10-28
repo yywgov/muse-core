@@ -1,0 +1,153 @@
+name: Muse mihomo core
+
+# 穿云 v1.7.0 dual core: the mihomo core is its own Go module in mihomo/ (own go.mod, pinned
+# mihomo v1.19.33), so it never shares a binary or go.mod with the sing-box core.
+# test: go vet + unit tests (pure Go) + size of a trimmed build per target (job summary).
+# windows: muse-mihomo.dll (c-shared, MinGW) with the same C exports as the main core's DLL.
+# Tag v*-muse* -> the DLL is attached to the tag's release (muse-mihomo-windows-amd64.tar.gz).
+on:
+  push:
+    branches: [muse, 'rel-*']
+    tags: ['v*-muse*']
+    paths: ['mihomo/**', '.github/workflows/mihomo.yml', 'v2/hcore/*.pb.go', 'v2/hcommon/*.pb.go', 'v2/hello/*.pb.go']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MIHOMO_TAGS: with_gvisor,no_tailscale,no_zerotier,no_easytier
+  MIHOMO_VERSION: v1.19.33
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mihomo
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: mihomo/go.mod
+          cache-dependency-path: mihomo/go.sum
+          check-latest: false
+
+      - name: Pinned mihomo version
+        run: |
+          grep -qE "^\s*github.com/metacubex/mihomo ${MIHOMO_VERSION}$" go.mod || { echo "::error::go.mod must pin mihomo ${MIHOMO_VERSION}"; exit 1; }
+
+      - name: go vet
+        run: go vet -tags "$MIHOMO_TAGS" ./...
+
+      - name: Unit tests
+        run: |
+          go test -tags "$MIHOMO_TAGS" ./... -count=1 -v 2>&1 | tee /tmp/mihomo-test.log | grep -E '^(=== RUN|--- |PASS|FAIL|ok|panic)|_test.go'
+          test ${PIPESTATUS[0]} -eq 0
+          for t in GeneratedCopiesInSync ClashYAMLKeepsSupportedAndMarksTheRest ClashYAMLDropsReferencesFailClosed URIListBase64 \
+                   BuildURIListDefaults BuildSettingsMapping BuildClashYAMLKeepsOwnGroupsAndRules BuildAllUnsupportedFailsClosed \
+                   StartStopStates RejectedNodeIsMarkedAndRestRuns SettingsPersistAndLastStart GRPCServerTokenAndCalls \
+                   BuiltConfigsParseInMihomo RefusedProxyErrorNamesIndex ServiceStartStopRealEngine; do
+            grep -q -- "--- PASS: Test$t " /tmp/mihomo-test.log || { echo "::error::Test$t did not run/pass"; exit 1; }
+          done
+
+      - name: Build size (trimmed, -s -w, uncompressed)
+        run: |
+          {
+            echo "### mihomo core build size ($MIHOMO_VERSION, tags $MIHOMO_TAGS)"
+            echo "| target | bytes | MB | gzip MB |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for t in android/arm64 linux/amd64 windows/amd64; do
+            os=${t%/*}; arch=${t#*/}; out=/tmp/muse-mihomo-$os-$arch
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -tags "$MIHOMO_TAGS" \
+              -ldflags "-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=$MIHOMO_VERSION" -o $out ./cmd/muse-mihomo
+            b=$(stat -c %s $out); g=$(gzip -9 -c $out | wc -c)
+            printf '| %s | %s | %.1f | %.1f |\n' "$t" "$b" "$(echo "$b/1000000" | bc -l)" "$(echo "$g/1000000" | bc -l)" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+
+  windows:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mihomo
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: mihomo/go.mod
+          cache-dependency-path: mihomo/go.sum
+          check-latest: false
+
+      # same as muse-android.yml: capped, with an apt fallback
+      - name: Setup MinGW
+        id: mingw
+        uses: egor-tensin/setup-mingw@v2
+        timeout-minutes: 8
+        continue-on-error: true
+        with:
+          platform: x64
+
+      - name: Setup MinGW (fallback)
+        if: steps.mingw.outcome != 'success'
+        timeout-minutes: 15
+        run: |
+          for i in 1 2 3; do
+            sudo timeout 300 apt-get update -q && sudo timeout 400 apt-get install -y -q mingw-w64 && break
+            echo "::warning::mingw install attempt $i failed"; sleep 10
+          done
+          x86_64-w64-mingw32-gcc --version
+
+      - name: Build muse-mihomo.dll
+        env:
+          CGO_ENABLED: '1'
+          GOOS: windows
+          GOARCH: amd64
+          CC: x86_64-w64-mingw32-gcc
+        run: |
+          mkdir -p ../bin
+          go build -buildmode=c-shared -trimpath -tags "$MIHOMO_TAGS" \
+            -ldflags "-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=$MIHOMO_VERSION" \
+            -o ../bin/muse-mihomo.dll ./bridge
+
+      - name: Check exports and record size
+        working-directory: bin
+        run: |
+          ls -la
+          x86_64-w64-mingw32-objdump -p muse-mihomo.dll > /tmp/exports.txt
+          for f in setup start stop restart freeString cleanup closeGrpc; do
+            grep -qE "\]\s+$f$" /tmp/exports.txt || { echo "::error::muse-mihomo.dll does not export $f"; exit 1; }
+          done
+          b=$(stat -c %s muse-mihomo.dll); g=$(gzip -9 -c muse-mihomo.dll | wc -c)
+          echo "### muse-mihomo.dll: $b bytes ($(echo "$b/1000000" | bc -l | cut -c1-5) MB, gzip $(echo "$g/1000000" | bc -l | cut -c1-5) MB)" | tee -a "$GITHUB_STEP_SUMMARY"
+          tar -czvf muse-mihomo-windows-amd64.tar.gz ./muse-mihomo.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muse-mihomo-windows-amd64
+          path: bin/muse-mihomo-windows-amd64.tar.gz
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: muse-mihomo-windows-amd64
+          path: dist
+      - name: Attach to the tag's release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/muse-mihomo-windows-amd64.tar.gz
+          prerelease: true
