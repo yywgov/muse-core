@@ -94,8 +94,19 @@ type Service struct {
 	proxyOn   bool
 	proxyPort uint16
 
-	// tunFD: Android VPN service's TUN (SetTunFD); 0 = the core makes its own TUN
-	tunFD atomic.Int32
+	// tunFD: Android VPN service's TUN (SetTunFD); 0 = the core makes its own TUN. Each start
+	// hands the engine its own duplicate (tunDup), which the engine closes when it stops, so the
+	// service's descriptor survives a stop → start inside one VPN session.
+	tunFD  atomic.Int32
+	tunDup int
+}
+
+// releaseTunDup closes a duplicate the engine never took (a start that failed before Apply).
+func (s *Service) releaseTunDup() {
+	if s.tunDup > 0 {
+		closeFD(s.tunDup)
+		s.tunDup = 0
+	}
 }
 
 // TunAdapterName names the Windows TUN adapter (and, in package engine, its description).
@@ -289,8 +300,16 @@ func (s *Service) startLocked(in *hcore.StartRequest) *hcore.CoreInfoResponse {
 	if err != nil {
 		return s.setState(hcore.CoreStates_STOPPED, mt, err.Error())
 	}
+	if fd := int(s.tunFD.Load()); fd > 0 && s.settings.EnableTun {
+		dup, err := dupFD(fd)
+		if err != nil {
+			return s.setState(hcore.CoreStates_STOPPED, hcore.MessageType_START_SERVICE, "tun: "+err.Error())
+		}
+		s.tunDup = dup
+	}
 	parsed, err := s.buildAndParse(p)
 	if err != nil {
+		s.releaseTunDup()
 		return s.setState(hcore.CoreStates_STOPPED, hcore.MessageType_ERROR_BUILDING_CONFIG, err.Error())
 	}
 	s.logUnsupported(p)
@@ -332,7 +351,7 @@ var proxyErr = regexp.MustCompile(`^proxy (\d+): (.*)$`)
 // ("proxy N: ...") is moved to Unsupported and the config rebuilt, so one bad node does not stop
 // the whole profile.
 func (s *Service) buildAndParse(p *profile.Profile) (any, error) {
-	rt := options.Runtime{TunFD: int(s.tunFD.Load())}
+	rt := options.Runtime{TunFD: s.tunDup}
 	if runtime.GOOS == "windows" {
 		rt.TunDevice = TunAdapterName
 	}
@@ -379,6 +398,7 @@ func (s *Service) StopCore() *hcore.CoreInfoResponse {
 	s.setState(hcore.CoreStates_STOPPING, hcore.MessageType_EMPTY, "")
 	s.syncSystemProxy(false)
 	s.eng.Stop()
+	s.tunDup = 0 // closed by the engine with its TUN
 	s.profile = nil
 	s.nodesHub.publish(false)
 	return s.setState(hcore.CoreStates_STOPPED, hcore.MessageType_EMPTY, "")

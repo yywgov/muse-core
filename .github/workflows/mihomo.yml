@@ -156,6 +156,47 @@ jobs:
           path: bin/muse-mihomo-windows-amd64.tar.gz
           retention-days: 14
 
+  # 穿云 v1.7.0 M3: Android JNI library for the app's separate VPN process (arm64-v8a)
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mihomo
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: mihomo/go.mod
+          cache-dependency-path: mihomo/go.sum
+          check-latest: false
+
+      - name: Build libmusecompat.so (arm64-v8a)
+        run: |
+          ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "NDK: $ndk"
+          export CGO_ENABLED=1 GOOS=android GOARCH=arm64
+          export CC="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          mkdir -p ../bin
+          go build -buildmode=c-shared -trimpath -tags "$MIHOMO_TAGS" \
+            -ldflags "-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=$MIHOMO_VERSION" \
+            -o ../bin/libmusecompat.so ./android
+          rm -f ../bin/libmusecompat.h
+
+      - name: Check JNI exports and record size
+        working-directory: bin
+        run: |
+          ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          nm="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          "$nm" -D --defined-only libmusecompat.so | grep -E 'Java_|museCompat' | tee /tmp/syms.txt
+          for f in nativeSetup nativeSetTunFd nativeStop nativeVersion; do
+            grep -q "Java_com_hiddify_hiddify_bg_CompatCore_$f" /tmp/syms.txt || { echo "::error::libmusecompat.so does not export $f"; exit 1; }
+          done
+          b=$(stat -c %s libmusecompat.so); g=$(gzip -9 -c libmusecompat.so | wc -c)
+          echo "### libmusecompat.so (arm64): $b bytes ($(echo "$b/1000000" | bc -l | cut -c1-5) MB, gzip $(echo "$g/1000000" | bc -l | cut -c1-5) MB)" | tee -a "$GITHUB_STEP_SUMMARY"
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [test, windows]

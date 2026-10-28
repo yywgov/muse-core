@@ -2,6 +2,7 @@ package grpcsvc
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/yywgov/muse-core/mihomo/hcorepb/hcore"
@@ -11,8 +12,11 @@ type fakeProxy struct {
 	calls []string
 }
 
-func (p *fakeProxy) Set(port uint16) error { p.calls = append(p.calls, "set:"+itoa(int(port))); return nil }
-func (p *fakeProxy) Clear() error          { p.calls = append(p.calls, "clear"); return nil }
+func (p *fakeProxy) Set(port uint16) error {
+	p.calls = append(p.calls, "set:"+itoa(int(port)))
+	return nil
+}
+func (p *fakeProxy) Clear() error { p.calls = append(p.calls, "clear"); return nil }
 
 func itoa(n int) string {
 	if n == 0 {
@@ -93,7 +97,8 @@ func TestSystemProxyFollowsStartStop(t *testing.T) {
 	}
 }
 
-// Android: the VPN service's TUN fd goes into the config; routes stay with the service.
+// Android: the VPN service's TUN goes into the config as a duplicate per start (the engine closes
+// its copy on stop; the service keeps its own for the next start); routes stay with the service.
 func TestTunFileDescriptorFromService(t *testing.T) {
 	f := newFake()
 	s := New(f)
@@ -110,14 +115,43 @@ func TestTunFileDescriptorFromService(t *testing.T) {
 	}
 	s.StopCore()
 
-	s.SetTunFD(42)
+	dev, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dev.Close()
+	orig := int(dev.Fd())
+	s.SetTunFD(orig)
 	s.StartCore(&hcore.StartRequest{ConfigPath: path})
 	tun = f.lastConfig(t)["tun"].(map[string]any)
-	if tun["file-descriptor"] != 42 || tun["auto-route"] != false || tun["auto-detect-interface"] != false {
-		t.Fatalf("fd config %v", tun)
+	first, _ := tun["file-descriptor"].(int)
+	if first <= 0 || first == orig || tun["auto-route"] != false || tun["auto-detect-interface"] != false {
+		t.Fatalf("fd config %v (service fd %d)", tun, orig)
 	}
 	if _, ok := tun["strict-route"]; ok {
 		t.Fatalf("strict-route belongs to the VPN service: %v", tun)
 	}
+	// a hot reload keeps the same TUN
+	s.HotReloadCore(&hcore.StartRequest{ConfigPath: path})
+	if got := f.lastConfig(t)["tun"].(map[string]any)["file-descriptor"]; got != first {
+		t.Fatalf("hot reload changed the TUN fd: %v → %v", first, got)
+	}
 	s.StopCore()
+	closeFD(first) // the real engine closes it with its TUN
+
+	// proxy mode inside the VPN service: no TUN, nothing duplicated
+	settings(t, s, `{"enable-tun":false}`)
+	s.StartCore(&hcore.StartRequest{ConfigPath: path})
+	if _, ok := f.lastConfig(t)["tun"]; ok {
+		t.Fatal("tun without enable-tun")
+	}
+	s.StopCore()
+
+	// a descriptor that cannot be duplicated: the start fails cleanly
+	settings(t, s, `{"enable-tun":true}`)
+	s.SetTunFD(1 << 20)
+	res := s.StartCore(&hcore.StartRequest{ConfigPath: path})
+	if res.CoreState != hcore.CoreStates_STOPPED || res.MessageType != hcore.MessageType_START_SERVICE {
+		t.Fatalf("bad fd start %v", res)
+	}
 }
