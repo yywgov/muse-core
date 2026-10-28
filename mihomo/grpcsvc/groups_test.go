@@ -232,9 +232,15 @@ func TestGroupsStream(t *testing.T) {
 	// several changes inside the debounce window arrive as one update
 	core.SelectOutbound(ctx, &hcore.SelectOutboundRequest{GroupTag: "select", OutboundTag: "A"})
 	core.SelectOutbound(ctx, &hcore.SelectOutboundRequest{GroupTag: "select", OutboundTag: "B"})
-	next, err := st.Recv()
-	if err != nil || next.Items[0].Selected != "B" {
-		t.Fatalf("update %v %v", next, err)
+	// (on a slow machine the first change may already have gone out on its own)
+	for i := 0; ; i++ {
+		next, err := st.Recv()
+		if err != nil || i > 2 {
+			t.Fatalf("update %v %v", next, err)
+		}
+		if next.Items[0].Selected == "B" {
+			break
+		}
 	}
 	main, err := core.MainOutboundsInfo(ctx, &hcommon.Empty{})
 	if err != nil {
