@@ -49,7 +49,7 @@ jobs:
           go test -tags "$MIHOMO_TAGS" ./... -count=1 -v 2>&1 | tee /tmp/mihomo-test.log | grep -E '^(=== RUN|--- |PASS|FAIL|ok|panic)|_test.go'
           if [ ${PIPESTATUS[0]} -ne 0 ]; then
             # failures as one annotation (readable on the run page without signing in)
-            msg=$(grep -E -A12 -- '--- FAIL|^panic' /tmp/mihomo-test.log | head -60 | sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g')
+            msg=$(grep -E -B10 -A2 -- '--- FAIL|^panic' /tmp/mihomo-test.log | head -60 | sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g')
             echo "::error title=go test failed::$msg"
             exit 1
           fi
@@ -68,7 +68,7 @@ jobs:
         run: |
           go test -race -tags "$MIHOMO_TAGS" ./grpcsvc/ ./profile/ ./options/ -count=1 2>&1 | tee /tmp/race.log | tail -20
           if [ ${PIPESTATUS[0]} -ne 0 ]; then
-            msg=$(grep -E -A12 -- '--- FAIL|WARNING: DATA RACE|^panic' /tmp/race.log | head -60 | sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g')
+            msg=$(grep -E -B10 -A12 -- '--- FAIL|WARNING: DATA RACE|^panic' /tmp/race.log | head -60 | sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g')
             echo "::error title=race test failed::$msg"
             exit 1
           fi
