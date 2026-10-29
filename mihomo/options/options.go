@@ -2,8 +2,9 @@
 // the settings call of the control API) to a mihomo config, around the proxies and groups of a profile.
 //
 // Block M1 maps the basics (ports, local API, log level, IPv6, LAN access, DNS servers, the
-// default groups, test URL/interval). Routing presets, rule sets, Fake-IP and TUN details are
-// block M4; until then the defaults below apply.
+// default groups, test URL/interval). Block M3-4 adds routing like the main core (rules.go: the
+// app's rule list and region as rules, rule providers and the direct-DNS policy). Fake-IP and
+// finer TUN details are not mapped yet; the defaults below apply.
 package options
 
 import (
@@ -45,6 +46,19 @@ type Settings struct {
 	BypassLAN       bool     `json:"bypass-lan"`
 	TestWorkers     int      `json:"muse-test-workers"`    // 4–64, 0 = 16 (same as the main core)
 	TestTimeoutMs   int      `json:"muse-test-timeout-ms"` // 0 = 5000
+	// M3-4: routing like the main core (rules.go): the region ("cn": mainland direct) and the
+	// app's rule list. Kept raw: a list this core cannot read never fails the settings.
+	Region       string          `json:"region"`
+	RouteRuleRaw json.RawMessage `json:"route-rule"`
+}
+
+// Routes maps the app's rule list (rules.go); an unreadable list maps to nothing (logged by the caller).
+func (s Settings) Routes() (RoutePlan, error) {
+	rr, err := ParseRouteRule(s.RouteRuleRaw)
+	if err != nil {
+		return PlanRoutes(nil, s.Region), err
+	}
+	return PlanRoutes(rr, s.Region), nil
 }
 
 // Workers is the number of delay tests run at once.
@@ -227,17 +241,40 @@ func Build(p *profile.Profile, s Settings, rt Runtime) ([]byte, error) {
 		cfg["external-controller"] = rt.ControllerAddr
 		cfg["secret"] = rt.Secret
 	}
-	remote, direct := dnsServer(s.RemoteDNS), dnsServer(s.DirectDNS)
-	dns := map[string]any{
-		"enable":                  true,
-		"ipv6":                    ipv6(s.IPv6Mode),
-		"enhanced-mode":           "redir-host",
-		"nameserver":              []any{remote},
-		"proxy-server-nameserver": []any{direct},
-		"default-nameserver":      []any{"223.5.5.5", "119.29.29.29"},
+	plan, _ := s.Routes()
+	if plan.Process {
+		// only looked up for the rules that name apps
+		cfg["find-process-mode"] = "strict"
 	}
+	remote, direct := dnsServer(s.RemoteDNS), dnsServer(s.DirectDNS)
+	bootstrap := []any{"223.5.5.5", "119.29.29.29"}
+	directNS := []any{direct}
 	if direct == "system" {
-		dns["proxy-server-nameserver"] = []any{"223.5.5.5"}
+		directNS = []any{"223.5.5.5"}
+	}
+	// the direct DNS always goes straight out (never through a node), like the main core's
+	pinned := make([]any, 0, len(directNS))
+	for _, d := range directNS {
+		pinned = append(pinned, directOut(fmt.Sprint(d)))
+	}
+	dns := map[string]any{
+		"enable":        true,
+		"ipv6":          ipv6(s.IPv6Mode),
+		"enhanced-mode": "redir-host",
+		// the remote DNS follows the rules (through the node for the rest of the world), like the
+		// main core sends it through the main group; node addresses use the direct DNS
+		"respect-rules":           true,
+		"nameserver":              []any{remote},
+		"proxy-server-nameserver": directNS,
+		"direct-nameserver":       pinned,
+		"default-nameserver":      bootstrap,
+	}
+	if len(plan.DirectDNS) > 0 {
+		policy := map[string]any{}
+		for _, k := range plan.DirectDNS {
+			policy[k] = pinned
+		}
+		dns["nameserver-policy"] = policy
 	}
 	cfg["dns"] = dns
 	if s.EnableTun {
@@ -275,8 +312,21 @@ func Build(p *profile.Profile, s Settings, rt Runtime) ([]byte, error) {
 	if len(p.Providers) > 0 {
 		cfg["proxy-providers"] = p.Providers
 	}
-	if len(p.RuleProviders) > 0 {
-		cfg["rule-providers"] = p.RuleProviders
+	ruleProviders := map[string]any{}
+	for n, v := range p.RuleProviders {
+		ruleProviders[n] = v
+	}
+	for n, rp := range plan.Providers {
+		if _, taken := ruleProviders[n]; taken {
+			continue
+		}
+		ruleProviders[n] = map[string]any{
+			"type": "http", "behavior": rp.Behavior, "format": "mrs", "url": rp.URL,
+			"path": "./ruleset/" + n + ".mrs", "interval": RuleSetInterval, "proxy": GroupSelect,
+		}
+	}
+	if len(ruleProviders) > 0 {
+		cfg["rule-providers"] = ruleProviders
 	}
 	if len(p.SubRules) > 0 {
 		cfg["sub-rules"] = p.SubRules
@@ -343,6 +393,10 @@ func Build(p *profile.Profile, s Settings, rt Runtime) ([]byte, error) {
 		rules = append(rules, "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve", "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
 			"IP-CIDR,172.16.0.0/12,DIRECT,no-resolve", "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve")
 	}
+	// the app's rules first (国内直连, the user's own, 去广告 …), then the subscription's
+	for _, r := range plan.Rules {
+		rules = append(rules, r)
+	}
 	hasMatch := false
 	for _, r := range p.Rules {
 		rules = append(rules, r)
@@ -355,6 +409,14 @@ func Build(p *profile.Profile, s Settings, rt Runtime) ([]byte, error) {
 	}
 	cfg["rules"] = rules
 	return yaml.Marshal(cfg)
+}
+
+// directOut pins a DNS server to the direct outbound ("223.5.5.5#DIRECT"); "system" stays as is.
+func directOut(addr string) string {
+	if addr == "system" || strings.Contains(addr, "#") {
+		return addr
+	}
+	return addr + "#DIRECT"
 }
 
 func sortAny(v []any) {

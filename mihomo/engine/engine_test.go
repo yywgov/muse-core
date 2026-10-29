@@ -235,3 +235,40 @@ func TestGroupsSelectTestReloadRealEngine(t *testing.T) {
 		t.Error("mixed port closed by hot reload")
 	}
 }
+
+// M3-4: routing like the main core (国内直连 rule sets, the user's combined rules, the direct-DNS
+// policy and the remote DNS following the rules) must load in mihomo itself. Parsing only: the
+// lists are fetched when a config is applied, so this stays offline.
+func TestRoutedConfigParsesInMihomo(t *testing.T) {
+	m := &Mihomo{}
+	m.SetHomeDir(t.TempDir())
+	geo := "https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set"
+	settings := `{"region":"cn","direct-dns-address":"udp://223.5.5.5","remote-dns-address":"https://1.1.1.1/dns-query","route-rule":{"rules":[
+	 {"list_order":0,"enabled":true,"name":"builtin:bypassLan","outbound":"direct","ip_cidr":["10.0.0.0/8","fc00::/7"]},
+	 {"list_order":1,"enabled":true,"name":"builtin:blockAds","outbound":"block","rule_set":["` + geo + `/block/geosite-category-ads-all.srs"]},
+	 {"list_order":2,"enabled":true,"name":"builtin:bypassRegion","outbound":"direct","rule_set":["` + geo + `/country/geosite-{region}.srs","` + geo + `/country/geoip-{region}.srs"]},
+	 {"list_order":3,"enabled":true,"outbound":"direct","network":"udp","port_range":["27015:27050"],"domain_suffix":["steam.example"]},
+	 {"list_order":4,"enabled":true,"outbound":"direct","process_name":["a.exe","b.exe"]},
+	 {"list_order":5,"enabled":true,"outbound":"block","protocol":["quic"]},
+	 {"list_order":6,"enabled":true,"domain":["x.ai"],"domain_regex":["^a\\.(b|c)$"]}]}}`
+	s, err := options.ParseSettings(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, sub := range map[string]string{"yaml": yamlSub, "uri": uriSub} {
+		p, err := profile.Parse([]byte(sub))
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf, err := options.Build(p, s, options.Runtime{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(buf), "RULE-SET,muse-geosite-cn,DIRECT") || !strings.Contains(string(buf), "respect-rules: true") {
+			t.Fatalf("%s: routing missing\n%s", name, buf)
+		}
+		if _, err := m.Parse(buf); err != nil {
+			t.Fatalf("%s: mihomo rejected the routed config: %v\n%s", name, err, buf)
+		}
+	}
+}

@@ -2,8 +2,8 @@
 // main core serves) on top of a mihomo engine. Block M1 implements Setup, Start, Stop, the
 // status stream (CoreInfoListener), GetSystemInfo / GetSystemInfoStream, LogListener, settings
 // (the settings call) and Close; block M2 adds the node groups (OutboundsInfo, MainOutboundsInfo),
-// SelectOutbound, UrlTest / UrlTestActive, HotReload and Restart (groups.go). Other calls answer
-// Unimplemented until their block.
+// SelectOutbound, UrlTest / UrlTestActive, HotReload and Restart (groups.go); block M3-4 adds Parse
+// (parse.go: subscriptions are checked and kept as they came). Other calls answer Unimplemented.
 package grpcsvc
 
 import (
