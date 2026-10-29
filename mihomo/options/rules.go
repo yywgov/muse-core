@@ -143,11 +143,21 @@ type RoutePlan struct {
 	Skipped   []string                // why a rule (or part of one) was left out
 }
 
-// PlanRoutes maps the enabled rules in their list order.
+// PlanRoutes maps the enabled rules in their list order. Without a list (an app that sends none)
+// the region alone decides, as in the main core: the region's domains (".cn") and its geosite /
+// geoip lists go direct, resolved by the direct DNS.
 func PlanRoutes(rr *RouteRule, region string) RoutePlan {
 	plan := RoutePlan{Providers: map[string]RuleProvider{}}
 	if rr == nil {
-		return plan
+		r := strings.ToLower(strings.TrimSpace(region))
+		if r == "" || r == "other" || badPayload(r) {
+			return plan
+		}
+		rr = &RouteRule{Rules: []AppRule{{
+			Enabled: true, Name: "region", Outbound: json.RawMessage(`"direct"`),
+			DomainSuffixes: []string{r},
+			RuleSets:       []string{"geosite-{region}.srs", "geoip-{region}.srs"},
+		}}}
 	}
 	rules := make([]AppRule, 0, len(rr.Rules))
 	for _, r := range rr.Rules {

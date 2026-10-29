@@ -173,7 +173,7 @@ func TestUserRulesAndQualifiers(t *testing.T) {
 
 // A list this core cannot read never fails the settings or the start: it maps to nothing.
 func TestBadRouteRuleIgnored(t *testing.T) {
-	s := settingsWith(t, `{"route-rule":"not an object","region":"cn"}`)
+	s := settingsWith(t, `{"route-rule":"not an object","region":"other"}`)
 	if _, err := s.Routes(); err == nil {
 		t.Fatal("expected a route-rule error")
 	}
@@ -205,4 +205,21 @@ func toStrings(v any) []string {
 		out = append(out, x.(string))
 	}
 	return out
+}
+
+// No list from the app: the region decides alone, like the main core (".cn" and the cn lists direct).
+func TestRegionWithoutListLikeMainCore(t *testing.T) {
+	plan := PlanRoutes(nil, "cn")
+	want := []string{"DOMAIN-SUFFIX,cn,DIRECT", "RULE-SET,muse-geosite-cn,DIRECT", "RULE-SET,muse-geoip-cn,DIRECT"}
+	if !reflect.DeepEqual(plan.Rules, want) {
+		t.Fatalf("%v", plan.Rules)
+	}
+	if !reflect.DeepEqual(plan.DirectDNS, []string{"+.cn", "rule-set:muse-geosite-cn"}) {
+		t.Fatalf("%v", plan.DirectDNS)
+	}
+	for _, r := range []string{"", "other", "OTHER"} {
+		if p := PlanRoutes(nil, r); len(p.Rules) != 0 {
+			t.Fatalf("%q: %v", r, p.Rules)
+		}
+	}
 }
