@@ -47,6 +47,8 @@ type appRouteRules struct {
 	ruleSets   []option.RuleSet
 	tagByURL   map[string]string
 	usedTags   map[string]bool
+	// 穿云 1.6.4: whether the resolve rule (museResolveRule) is already in routeRules
+	resolved bool
 }
 
 func buildAppRouteRules(hopt *HiddifyOptions) *appRouteRules {
@@ -124,6 +126,13 @@ func (b *appRouteRules) add(rule *Rule) {
 		return
 	}
 
+	// 穿云 1.6.4: a name (local proxy port) is resolved right before the first direct geoip rule, so
+	// that rule can match it (muse_dns.go, cause 3); not with fake DNS, which avoids looking up names
+	if b.needsResolve(rule, ruleSets) {
+		b.routeRules = append(b.routeRules, museResolveRule())
+		b.resolved = true
+	}
+
 	action := option.RuleAction{Action: C.RuleActionTypeRoute}
 	switch rule.GetOutbound() {
 	case Outbound_direct:
@@ -145,6 +154,22 @@ func (b *appRouteRules) add(rule *Rule) {
 
 	b.addDNSRule(rule, raw, dnsRuleSets)
 	b.addGeoIPDNSRule(rule, raw, ruleSets)
+}
+
+// needsResolve: the first rule that sends geoip rule-sets direct, while fake DNS is off.
+func (b *appRouteRules) needsResolve(rule *Rule, ruleSets []string) bool {
+	if b.resolved || b.fakeDNS {
+		return false
+	}
+	if rule.GetOutbound() != Outbound_direct && rule.GetOutbound() != Outbound_direct_with_fragment {
+		return false
+	}
+	for _, tag := range ruleSets {
+		if strings.HasPrefix(tag, "geoip-") {
+			return true
+		}
+	}
+	return false
 }
 
 // addGeoIPDNSRule (Muse/穿云): a direct rule's geoip rule-sets also steer DNS. A name no earlier rule
@@ -181,7 +206,7 @@ func (b *appRouteRules) addGeoIPDNSRule(rule *Rule, raw option.RawDefaultRule, r
 				Server: DNSMultiDirectTag,
 				AbstractDNSRouteActionOptions: option.AbstractDNSRouteActionOptions{
 					Strategy:   b.strategy,
-					RewriteTTL: &DEFAULT_DNS_TTL,
+					RewriteTTL: museDirectDNSRewriteTTL,
 				},
 			},
 		},
@@ -223,7 +248,7 @@ func (b *appRouteRules) addDNSRule(rule *Rule, raw option.RawDefaultRule, dnsRul
 				Server: DNSMultiDirectTag,
 				AbstractDNSRouteActionOptions: option.AbstractDNSRouteActionOptions{
 					Strategy:   b.strategy,
-					RewriteTTL: &DEFAULT_DNS_TTL,
+					RewriteTTL: museDirectDNSRewriteTTL,
 				},
 			},
 		}

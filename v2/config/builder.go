@@ -891,7 +891,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 					Server: DNSMultiDirectTag,
 					AbstractDNSRouteActionOptions: option.AbstractDNSRouteActionOptions{
 						Strategy:       hopt.DirectDnsDomainStrategy,
-						RewriteTTL:     &DEFAULT_DNS_TTL,
+						RewriteTTL:     museDirectDNSRewriteTTL,
 						BypassIfFailed: false,
 					},
 				},
@@ -925,7 +925,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 					Server: DNSMultiDirectTag,
 					AbstractDNSRouteActionOptions: option.AbstractDNSRouteActionOptions{
 						Strategy:       hopt.DirectDnsDomainStrategy,
-						RewriteTTL:     &DEFAULT_DNS_TTL,
+						RewriteTTL:     museDirectDNSRewriteTTL,
 						BypassIfFailed: false,
 					},
 				},

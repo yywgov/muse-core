@@ -7,7 +7,8 @@ name: Muse Core
 # hiddify-lib-android.tar.gz and hiddify-lib-windows-amd64.tar.gz.
 on:
   push:
-    branches: [muse]
+    # net-*: 穿云 network fix branches (tests + builds, no release)
+    branches: [muse, 'net-*']
     tags: ['v*-muse*']
     paths-ignore: ['**.md', 'docs/**']
   workflow_dispatch:
@@ -47,8 +48,12 @@ jobs:
 
       - name: Muse unit tests
         run: |
-          go test -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_grpc ./v2/config/ -run 'Muse|TestSetInbound|RouteRule' -count=1 -v 2>&1 | grep -E '^(=== RUN|--- |PASS|FAIL|ok|panic)|_test.go' 
+          go test -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_grpc ./v2/config/ -run 'Muse|TestSetInbound|RouteRule|DNSGroup' -count=1 -v 2>&1 | tee /tmp/muse-config.log | grep -E '^(=== RUN|--- |PASS|FAIL|ok|panic)|_test.go' 
           test ${PIPESTATUS[0]} -eq 0
+          # 穿云 core muse.18: domestic DNS / direct routing (muse_dns_test.go)
+          for t in MuseDirectDNSGroupAddresses MuseRemoteDNSGroupAddresses MuseDomesticDNSIsDirectAndDomestic MuseDomesticTrafficGoesDirect MuseResolveRulePlacement MuseDomesticQUICNotRejected BuildConfigDNSGroups; do
+            grep -q -- "--- PASS: Test$t " /tmp/muse-config.log || { echo "::error::Test$t did not run/pass"; exit 1; }
+          done
           go test -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_grpc ./v2/hcore/ -run 'TestSpeedSince' -count=1 -v
 
       # 穿云 1.2.1: steady node delays (patch 0003) + the monitoring / balancer tests around them;

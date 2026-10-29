@@ -84,13 +84,13 @@ func setDns(options *option.Options, opt *HiddifyOptions, staticIps *map[string]
 	if err != nil {
 		return err
 	}
-	remoteGroup, remoteMembers, err := getDNSGroupOptions(DNSMultiRemoteTag, *remote_dns, remoteAddr, DNSDirectTag, func(string) string {
+	remoteGroup, remoteMembers, err := getDNSGroupOptionsFor(DNSMultiRemoteTag, *remote_dns, museRemoteDNSGroupAddresses(remoteAddr), DNSDirectTag, func(string) string {
 		return OutboundMainDetour
 	})
 	if err != nil {
 		return err
 	}
-	directGroup, directMembers, err := getDNSGroupOptions(DNSMultiDirectTag, *direct_dns, opt.DirectDnsAddress, DNSLocalTag, func(address string) string {
+	directGroup, directMembers, err := getDNSGroupOptionsFor(DNSMultiDirectTag, *direct_dns, museDirectDNSGroupAddresses(opt.DirectDnsAddress), DNSLocalTag, func(address string) string {
 		if strings.HasPrefix(address, "udp://") {
 			return ""
 		}
@@ -116,11 +116,10 @@ func setDns(options *option.Options, opt *HiddifyOptions, staticIps *map[string]
 
 	dnsOptions := option.DNSOptions{
 		RawDNSOptions: option.RawDNSOptions{
-			DNSClientOptions: option.DNSClientOptions{
-				IndependentCache: opt.IndependentDNSCache && !C.IsIos,
-				DisableExpire:    true,
-			},
-			Final: DNSMultiRemoteTag,
+			// 穿云 1.6.4: museDNSClientOptions (answers expire with their real TTL, stale ones are
+			// served once while refreshed) instead of a cache that never expired
+			DNSClientOptions: museDNSClientOptions(opt),
+			Final:            DNSMultiRemoteTag,
 
 			Servers: []option.DNSServerOptions{
 				*static_dns,
@@ -377,9 +376,15 @@ func dnsGroupAddresses(selected string) []string {
 // getDNSGroupOptions builds a sequential DNS group: the already built selected server first,
 // then a member per remaining address of dnsGroupAddresses.
 func getDNSGroupOptions(tag string, selected option.DNSServerOptions, selectedAddress, domainResolver string, detour func(address string) string) (*option.DNSServerOptions, []option.DNSServerOptions, error) {
+	return getDNSGroupOptionsFor(tag, selected, dnsGroupAddresses(selectedAddress), domainResolver, detour)
+}
+
+// getDNSGroupOptionsFor builds a sequential DNS group from addresses (addresses[0] is the already
+// built selected server).
+func getDNSGroupOptionsFor(tag string, selected option.DNSServerOptions, addresses []string, domainResolver string, detour func(address string) string) (*option.DNSServerOptions, []option.DNSServerOptions, error) {
 	members := []string{selected.Tag}
 	var servers []option.DNSServerOptions
-	for i, address := range dnsGroupAddresses(selectedAddress)[1:] {
+	for i, address := range addresses[1:] {
 		server, err := getDNSServerOptions(fmt.Sprint(tag, "-", i+1), address, domainResolver, detour(address))
 		if err != nil {
 			return nil, nil, E.Cause(err, "dns group ", tag, ": ", address)

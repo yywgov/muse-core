@@ -47,6 +47,12 @@ func TestBuildConfigDNSGroups(t *testing.T) {
 	if options.DNS.Final != DNSMultiRemoteTag {
 		t.Fatalf("DNS final = %q, want the remote group", options.DNS.Final)
 	}
+	// 穿云 1.6.4: direct = selected + its TCP variant + a domestic resolver over UDP/TCP;
+	// remote = selected + one TCP fallback (muse_dns.go)
+	memberTypes := map[string][]string{
+		DNSMultiRemoteTag: {"", C.DNSTypeTCP},
+		DNSMultiDirectTag: {"", C.DNSTypeTCP, C.DNSTypeUDP, C.DNSTypeTCP},
+	}
 	for tag, want := range map[string]string{DNSMultiRemoteTag: DNSRemoteTag, DNSMultiDirectTag: DNSDirectTag} {
 		group, ok := servers[tag]
 		if !ok || group.Type != C.DNSTypeGroup {
@@ -59,10 +65,10 @@ func TestBuildConfigDNSGroups(t *testing.T) {
 		if len(g.IgnoreRanges) != 1 || netip.Prefix(g.IgnoreRanges[0]).String() != dnsGroupIgnoreRange {
 			t.Fatalf("%s: ignore ranges %v", tag, g.IgnoreRanges)
 		}
-		if g.Servers[0] != want || len(g.Servers) != 6 {
-			t.Fatalf("%s: members %v, want %s first and 6 members", tag, g.Servers, want)
+		wantTypes := memberTypes[tag]
+		if g.Servers[0] != want || len(g.Servers) != len(wantTypes) {
+			t.Fatalf("%s: members %v, want %s first and %d members", tag, g.Servers, want, len(wantTypes))
 		}
-		wantTypes := []string{"", C.DNSTypeTCP, C.DNSTypeTLS, C.DNSTypeUDP, C.DNSTypeTCP, C.DNSTypeTLS}
 		for i, member := range g.Servers[1:] {
 			if servers[member].Type != wantTypes[i+1] {
 				t.Fatalf("%s: member %d (%s) type %q, want %q", tag, i+1, member, servers[member].Type, wantTypes[i+1])
