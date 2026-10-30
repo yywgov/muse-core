@@ -16,3 +16,5 @@ data
 node_modules
 *.db
 *.json
+# mihomo module test fixtures
+!mihomo/**/testdata/*.json

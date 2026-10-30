@@ -1,0 +1,29 @@
+// what the main core stores for the links in pair_links.txt (its subscription parser's output)
+{
+  "outbounds": [
+    {"type": "selector", "tag": "select", "outbounds": ["vless-reality"]},
+    {"type": "vless", "tag": "vless-reality", "server": "a.example.com", "server_port": 443,
+     "uuid": "11111111-2222-3333-4444-555555555555", "flow": "xtls-rprx-vision",
+     "tls": {"enabled": true, "server_name": "www.apple.com", "utls": {"enabled": true, "fingerprint": "chrome"},
+             "reality": {"enabled": true, "public_key": "PUBKEY123", "short_id": "ab12"}}},
+    {"type": "vless", "tag": "vless-ws", "server": "b.example.com", "server_port": 443,
+     "uuid": "11111111-2222-3333-4444-555555555555",
+     "tls": {"enabled": true, "server_name": "b.example.com"},
+     "transport": {"type": "ws", "path": "/ws", "headers": {"Host": "cdn.example.com"}}},
+    {"type": "vless", "tag": "vless-grpc", "server": "c.example.com", "server_port": 443,
+     "uuid": "11111111-2222-3333-4444-555555555555",
+     "tls": {"enabled": true, "server_name": "c.example.com"},
+     "transport": {"type": "grpc", "service_name": "gsvc"}},
+    {"type": "trojan", "tag": "trojan", "server": "d.example.com", "server_port": 443, "password": "pw",
+     "tls": {"enabled": true, "server_name": "d.example.com", "insecure": true}},
+    {"type": "hysteria2", "tag": "hy2", "server": "e.example.com", "server_port": 443, "password": "pw",
+     "obfs": {"type": "salamander", "password": "op"},
+     "tls": {"enabled": true, "server_name": "e.example.com"}},
+    {"type": "tuic", "tag": "tuic", "server": "f.example.com", "server_port": 443,
+     "uuid": "11111111-2222-3333-4444-555555555555", "password": "pw", "congestion_control": "bbr",
+     "tls": {"enabled": true, "server_name": "f.example.com", "alpn": ["h3"]}},
+    {"type": "anytls", "tag": "anytls", "server": "g.example.com", "server_port": 443, "password": "pw",
+     "tls": {"enabled": true, "server_name": "g.example.com"}},
+    {"type": "direct", "tag": "direct"}
+  ]
+}
