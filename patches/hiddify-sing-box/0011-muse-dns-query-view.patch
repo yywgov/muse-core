@@ -1,0 +1,1088 @@
+穿云 core muse.19: DNS query view for the app.
+The DNS client reports every answer it hands out (network exchange, cache hit,
+optimistic cache, rejected, failed) to one process-wide hook: domain, type, the
+server that answered (inside a group: the member, noted by the group transport),
+its configured address, answers, rcode, elapsed time, cached. The hook is nil
+unless the local API has a subscriber, so with nobody watching the cost is one
+atomic load per query. The local API serves it at /dns/queries (websocket:
+buffered 500-entry ring first, then live batches; plain GET = snapshot; DELETE
+clears). The first websocket installs the hook and the last one removes it; no
+timer or polling. Standard DNS behaviour is unchanged.
+
+diff --git a/dns/client.go b/dns/client.go
+index 0137d69e1..3296fcbd7 100644
+--- a/dns/client.go
++++ b/dns/client.go
+@@ -249,6 +249,7 @@ type exchangeOperation struct {
+ 	disableCache    bool
+ 	cacheKey        dnsCacheKey
+ 	releaseCond     func()
++	museStart       time.Time
+ }
+ 
+ func (o *exchangeOperation) release() {
+@@ -259,6 +260,7 @@ func (o *exchangeOperation) release() {
+ }
+ 
+ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool, allowWait bool) (*exchangeOperation, *dns.Msg, exchangeStatus, error) {
++	museStartTime := museStart()
+ 	err := ctx.Err()
+ 	if err != nil {
+ 		return nil, nil, exchangeDone, err
+@@ -294,6 +296,7 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
+ 		options:         options,
+ 		responseChecker: responseChecker,
+ 		disableCache:    disableCache,
++		museStart:       museStartTime,
+ 	}
+ 	if !disableCache {
+ 		cacheKey := c.newCacheKey(transport, question, message, options)
+@@ -313,11 +316,13 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
+ 					c.backgroundRefreshDNS(transport, cacheKey, message.Copy(), options, responseChecker)
+ 					logOptimisticResponse(c.logger, ctx, response)
+ 					response.Id = message.Id
++					c.museRecord(ctx, museStartTime, transport, question, response, true, true, nil)
+ 					operation.release()
+ 					return nil, response, exchangeDone, nil
+ 				} else if !isStale {
+ 					logCachedResponse(c.logger, ctx, response, ttl)
+ 					response.Id = message.Id
++					c.museRecord(ctx, museStartTime, transport, question, response, true, false, nil)
+ 					operation.release()
+ 					return nil, response, exchangeDone, nil
+ 				}
+@@ -349,6 +354,9 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
+ 		return nil, nil, exchangeDone, E.New("DNS query loopback in transport[", contextTransport, "]")
+ 	}
+ 	operation.ctx = adapter.ContextWithDNSTransportTag(ctx, transport.Tag())
++	if !museStartTime.IsZero() {
++		operation.ctx = museWithTrace(operation.ctx, museStartTime)
++	}
+ 	if !disableCache && responseChecker != nil && c.rdrc != nil {
+ 		rejected := c.rdrc.LoadRDRC(transport.Tag(), question.Name, question.Qtype)
+ 		if rejected {
+@@ -375,6 +383,7 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
+ 				c.rdrc.SaveRDRCAsync(transport.Tag(), question.Name, question.Qtype, c.logger)
+ 			}
+ 			logRejectedResponse(c.logger, ctx, response)
++			c.museRecord(ctx, operation.museStart, transport, question, response, false, false, ErrResponseRejected)
+ 			return response, ErrResponseRejected
+ 		}
+ 	}
+@@ -397,6 +406,7 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
+ 		}
+ 	}
+ 	logExchangedResponse(c.logger, ctx, response, timeToLive)
++	c.museRecord(ctx, operation.museStart, transport, question, response, false, false, nil)
+ 	return response, nil
+ }
+ 
+@@ -413,6 +423,7 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
+ 	defer operation.release()
+ 	response, err := c.exchangeToTransport(operation.ctx, transport, operation.message)
+ 	if err != nil {
++		c.museRecord(operation.ctx, operation.museStart, transport, operation.question, nil, false, false, err)
+ 		return nil, err
+ 	}
+ 	return c.finishExchange(transport, operation, response)
+@@ -440,6 +451,7 @@ func (c *Client) ExchangeAsync(ctx context.Context, transport adapter.DNSTranspo
+ 	finish := func(response *dns.Msg, exchangeErr error) {
+ 		cancel()
+ 		if exchangeErr != nil {
++			c.museRecord(operation.ctx, operation.museStart, transport, operation.question, nil, false, false, exchangeErr)
+ 			operation.release()
+ 			callback(nil, exchangeErr)
+ 			return
+@@ -567,6 +579,7 @@ func (c *Client) lookupToExchange(ctx context.Context, transport adapter.DNSTran
+ }
+ 
+ func (c *Client) questionCache(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool) ([]netip.Addr, error) {
++	museStartTime := museStart()
+ 	question := message.Question[0]
+ 	cacheKey := c.newCacheKey(transport, question, message, options)
+ 	response, _, isStale := c.loadResponse(cacheKey)
+@@ -580,6 +593,7 @@ func (c *Client) questionCache(ctx context.Context, transport adapter.DNSTranspo
+ 		c.backgroundRefreshDNS(transport, cacheKey, c.prepareExchangeMessage(message.Copy(), options), options, responseChecker)
+ 		logOptimisticResponse(c.logger, ctx, response)
+ 	}
++	c.museRecord(ctx, museStartTime, transport, question, response, true, isStale, nil)
+ 	if response.Rcode != dns.RcodeSuccess {
+ 		return nil, RcodeError(response.Rcode)
+ 	}
+diff --git a/dns/muse_query.go b/dns/muse_query.go
+new file mode 100644
+index 000000000..810826c21
+--- /dev/null
++++ b/dns/muse_query.go
+@@ -0,0 +1,212 @@
++package dns
++
++// 穿云 core: DNS query records for the app's DNS view.
++//
++// The client reports every answer it hands out (network exchange, cache hit or
++// failure) to one process-wide hook. The hook is nil unless the local API has a
++// subscriber, so with nobody watching the only cost is one atomic load per query.
++
++import (
++	"context"
++	"net/netip"
++	"strconv"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing/service"
++
++	"github.com/miekg/dns"
++)
++
++// MuseQuery is one DNS answer handed out by the client.
++type MuseQuery struct {
++	Time       time.Time
++	Domain     string
++	Type       string
++	Server     string // tag of the server that answered (a group member when a group was used)
++	ServerType string // udp, tcp, tls, https, quic, fakeip, local, hosts, ...
++	Address    string // server address as configured, empty for local/fakeip/hosts
++	Group      string // group tag when Server is a member of a group
++	Answers    []string
++	Rcode      string
++	Duration   time.Duration
++	Cached     bool
++	Optimistic bool
++	Error      string
++}
++
++// MuseQueryHook receives finished queries. It must not block.
++type MuseQueryHook func(query *MuseQuery)
++
++var museQueryHook atomic.Pointer[MuseQueryHook]
++
++// SetMuseQueryHook installs hook (nil removes it).
++func SetMuseQueryHook(hook MuseQueryHook) {
++	if hook == nil {
++		museQueryHook.Store(nil)
++		return
++	}
++	museQueryHook.Store(&hook)
++}
++
++// ClearMuseQueryHook removes hook only if it is still the installed one.
++func ClearMuseQueryHook(current *MuseQueryHook) bool {
++	return museQueryHook.CompareAndSwap(current, nil)
++}
++
++// LoadMuseQueryHook returns the installed hook pointer (for ClearMuseQueryHook).
++func LoadMuseQueryHook() *MuseQueryHook {
++	return museQueryHook.Load()
++}
++
++func museQueryActive() bool {
++	return museQueryHook.Load() != nil
++}
++
++type museTraceKey struct{}
++
++type museTrace struct {
++	start  time.Time
++	access sync.Mutex
++	member string
++}
++
++func museWithTrace(ctx context.Context, start time.Time) context.Context {
++	return context.WithValue(ctx, museTraceKey{}, &museTrace{start: start})
++}
++
++func museTraceFrom(ctx context.Context) *museTrace {
++	if ctx == nil {
++		return nil
++	}
++	trace, _ := ctx.Value(museTraceKey{}).(*museTrace)
++	return trace
++}
++
++// MuseNoteServer lets a group transport say which member answered.
++func MuseNoteServer(ctx context.Context, tag string) {
++	trace := museTraceFrom(ctx)
++	if trace == nil {
++		return
++	}
++	trace.access.Lock()
++	trace.member = tag
++	trace.access.Unlock()
++}
++
++// MuseServerAddress is implemented by transports built from remote server options.
++type MuseServerAddress interface {
++	MuseServerAddress() string
++}
++
++func (a *TransportAdapter) MuseServerAddress() string {
++	return a.museAddress
++}
++
++func museFormatAddress(server string, port uint16, transportType string) string {
++	if server == "" {
++		return ""
++	}
++	host := server
++	if addr, err := netip.ParseAddr(server); err == nil && addr.Is6() {
++		host = "[" + server + "]"
++	}
++	defaultPort := uint16(53)
++	switch transportType {
++	case "tls", "quic":
++		defaultPort = 853
++	case "https", "h3":
++		defaultPort = 443
++	}
++	if port != 0 && port != defaultPort {
++		host += ":" + strconv.Itoa(int(port))
++	}
++	if transportType == "" || transportType == "udp" {
++		return host
++	}
++	return transportType + "://" + host
++}
++
++func (c *Client) museDescribe(query *MuseQuery, transport adapter.DNSTransport, trace *museTrace) {
++	if transport == nil {
++		return
++	}
++	query.Server = transport.Tag()
++	query.ServerType = transport.Type()
++	if trace != nil {
++		trace.access.Lock()
++		member := trace.member
++		trace.access.Unlock()
++		if member != "" && member != query.Server {
++			query.Group = query.Server
++			query.Server = member
++			query.ServerType = ""
++			if c.ctx != nil {
++				if manager := service.FromContext[adapter.DNSTransportManager](c.ctx); manager != nil {
++					if memberTransport, loaded := manager.Transport(member); loaded {
++						transport = memberTransport
++						query.ServerType = memberTransport.Type()
++					}
++				}
++			}
++		}
++	}
++	if addresser, ok := transport.(MuseServerAddress); ok {
++		query.Address = addresser.MuseServerAddress()
++	}
++}
++
++func museAnswers(response *dns.Msg) []string {
++	if response == nil {
++		return nil
++	}
++	var answers []string
++	for _, record := range response.Answer {
++		switch rr := record.(type) {
++		case *dns.A:
++			if addr, ok := netip.AddrFromSlice(rr.A); ok {
++				answers = append(answers, addr.Unmap().String())
++			}
++		case *dns.AAAA:
++			if addr, ok := netip.AddrFromSlice(rr.AAAA); ok {
++				answers = append(answers, addr.String())
++			}
++		}
++	}
++	return answers
++}
++
++// museRecord reports one finished query. start is zero when recording was off
++// when the query began; such queries are skipped so a half-timed record never appears.
++func (c *Client) museRecord(ctx context.Context, start time.Time, transport adapter.DNSTransport, question dns.Question, response *dns.Msg, cached bool, optimistic bool, err error) {
++	hook := museQueryHook.Load()
++	if hook == nil || start.IsZero() {
++		return
++	}
++	query := &MuseQuery{
++		Time:       start,
++		Domain:     FqdnToDomain(question.Name),
++		Type:       dns.Type(question.Qtype).String(),
++		Duration:   time.Since(start),
++		Cached:     cached,
++		Optimistic: optimistic,
++	}
++	c.museDescribe(query, transport, museTraceFrom(ctx))
++	if response != nil {
++		query.Rcode = dns.RcodeToString[response.Rcode]
++		query.Answers = museAnswers(response)
++	}
++	if err != nil {
++		query.Error = err.Error()
++	}
++	(*hook)(query)
++}
++
++func museStart() time.Time {
++	if museQueryActive() {
++		return time.Now()
++	}
++	return time.Time{}
++}
+diff --git a/dns/muse_query_test.go b/dns/muse_query_test.go
+new file mode 100644
+index 000000000..77b94d9bb
+--- /dev/null
++++ b/dns/muse_query_test.go
+@@ -0,0 +1,234 @@
++package dns
++
++import (
++	"context"
++	"errors"
++	"net"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/service"
++
++	mDNS "github.com/miekg/dns"
++	"github.com/stretchr/testify/require"
++)
++
++// museTestTransport answers A queries with a fixed address after a short delay.
++type museTestTransport struct {
++	TransportAdapter
++	answer string
++	err    error
++	member string // when set, acts as a group: notes this member as the answering server
++	calls  int
++}
++
++func newMuseTestTransport(transportType, tag, server string, port uint16) *museTestTransport {
++	return &museTestTransport{
++		TransportAdapter: NewTransportAdapterWithRemoteOptions(transportType, tag, option.RemoteDNSServerOptions{
++			DNSServerAddressOptions: option.DNSServerAddressOptions{Server: server, ServerPort: port},
++		}),
++		answer: "1.2.3.4",
++	}
++}
++
++func (t *museTestTransport) Start(adapter.StartStage) error { return nil }
++func (t *museTestTransport) Close() error                   { return nil }
++func (t *museTestTransport) Reset()                         {}
++
++func (t *museTestTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
++	t.calls++
++	time.Sleep(2 * time.Millisecond)
++	if t.err != nil {
++		return nil, t.err
++	}
++	if t.member != "" {
++		MuseNoteServer(ctx, t.member)
++	}
++	response := new(mDNS.Msg)
++	response.SetReply(message)
++	response.Answer = []mDNS.RR{&mDNS.A{
++		Hdr: mDNS.RR_Header{Name: message.Question[0].Name, Rrtype: mDNS.TypeA, Class: mDNS.ClassINET, Ttl: 60},
++		A:   net.ParseIP(t.answer),
++	}}
++	return response, nil
++}
++
++func (t *museTestTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(*mDNS.Msg, error)) {
++	go func() {
++		response, err := t.Exchange(ctx, message)
++		callback(response, err)
++	}()
++}
++
++type museCollector struct {
++	access  sync.Mutex
++	queries []MuseQuery
++}
++
++func (c *museCollector) hook(query *MuseQuery) {
++	c.access.Lock()
++	c.queries = append(c.queries, *query)
++	c.access.Unlock()
++}
++
++func (c *museCollector) all() []MuseQuery {
++	c.access.Lock()
++	defer c.access.Unlock()
++	return append([]MuseQuery(nil), c.queries...)
++}
++
++func museTestClient(ctx context.Context, disableCache bool) *Client {
++	return NewClient(ClientOptions{
++		Context:      ctx,
++		DisableCache: disableCache,
++		Logger:       log.NewNOPFactory().Logger(),
++	})
++}
++
++func museQuestion(domain string) *mDNS.Msg {
++	message := new(mDNS.Msg)
++	message.SetQuestion(mDNS.Fqdn(domain), mDNS.TypeA)
++	return message
++}
++
++func TestMuseQueryNoHookRecordsNothing(t *testing.T) {
++	SetMuseQueryHook(nil)
++	transport := newMuseTestTransport("udp", "dns-direct", "223.5.5.5", 0)
++	client := museTestClient(context.Background(), false)
++	response, err := client.Exchange(context.Background(), transport, museQuestion("a.example"), adapter.DNSQueryOptions{}, nil)
++	require.NoError(t, err)
++	require.Len(t, response.Answer, 1)
++	require.True(t, museStart().IsZero(), "no hook -> no timing work")
++	require.Nil(t, museTraceFrom(context.Background()))
++}
++
++func TestMuseQueryExchangeAndCacheHit(t *testing.T) {
++	collector := &museCollector{}
++	SetMuseQueryHook(collector.hook)
++	defer SetMuseQueryHook(nil)
++	transport := newMuseTestTransport("udp", "dns-direct", "223.5.5.5", 0)
++	client := museTestClient(context.Background(), false)
++	_, err := client.Exchange(context.Background(), transport, museQuestion("b.example"), adapter.DNSQueryOptions{}, nil)
++	require.NoError(t, err)
++	_, err = client.Exchange(context.Background(), transport, museQuestion("b.example"), adapter.DNSQueryOptions{}, nil)
++	require.NoError(t, err)
++	require.Equal(t, 1, transport.calls, "second query served from cache")
++	queries := collector.all()
++	require.Len(t, queries, 2)
++	first := queries[0]
++	require.Equal(t, "b.example", first.Domain)
++	require.Equal(t, "A", first.Type)
++	require.Equal(t, "dns-direct", first.Server)
++	require.Equal(t, "udp", first.ServerType)
++	require.Equal(t, "223.5.5.5", first.Address)
++	require.Equal(t, []string{"1.2.3.4"}, first.Answers)
++	require.Equal(t, "NOERROR", first.Rcode)
++	require.False(t, first.Cached)
++	require.GreaterOrEqual(t, first.Duration, 2*time.Millisecond)
++	require.False(t, first.Time.IsZero())
++	require.True(t, queries[1].Cached)
++	require.Equal(t, []string{"1.2.3.4"}, queries[1].Answers)
++}
++
++func TestMuseQueryLookupCached(t *testing.T) {
++	collector := &museCollector{}
++	SetMuseQueryHook(collector.hook)
++	defer SetMuseQueryHook(nil)
++	transport := newMuseTestTransport("tcp", "dns-direct-group-1", "119.29.29.29", 0)
++	client := museTestClient(context.Background(), false)
++	options := adapter.DNSQueryOptions{LookupStrategy: C.DomainStrategyIPv4Only}
++	for i := 0; i < 2; i++ {
++		addresses, err := client.Lookup(context.Background(), transport, "c.example", options, nil)
++		require.NoError(t, err)
++		require.Len(t, addresses, 1)
++	}
++	queries := collector.all()
++	require.Len(t, queries, 2)
++	require.Equal(t, "tcp://119.29.29.29", queries[0].Address)
++	require.False(t, queries[0].Cached)
++	require.True(t, queries[1].Cached)
++}
++
++func TestMuseQueryErrorAndAsync(t *testing.T) {
++	collector := &museCollector{}
++	SetMuseQueryHook(collector.hook)
++	defer SetMuseQueryHook(nil)
++	transport := newMuseTestTransport("https", "dns-remote", "8.8.8.8", 0)
++	transport.err = errors.New("boom")
++	client := museTestClient(context.Background(), true)
++	_, err := client.Exchange(context.Background(), transport, museQuestion("d.example"), adapter.DNSQueryOptions{}, nil)
++	require.Error(t, err)
++	done := make(chan struct{})
++	client.ExchangeAsync(context.Background(), transport, museQuestion("e.example"), adapter.DNSQueryOptions{}, nil, func(*mDNS.Msg, error) { close(done) })
++	<-done
++	queries := collector.all()
++	require.Len(t, queries, 2)
++	for _, query := range queries {
++		require.Equal(t, "boom", query.Error)
++		require.Empty(t, query.Answers)
++		require.Equal(t, "https://8.8.8.8", query.Address)
++	}
++}
++
++func TestMuseQueryGroupMember(t *testing.T) {
++	collector := &museCollector{}
++	SetMuseQueryHook(collector.hook)
++	defer SetMuseQueryHook(nil)
++	member := newMuseTestTransport("tcp", "dns-direct-group-1", "119.29.29.29", 0)
++	group := &museTestTransport{
++		TransportAdapter: NewTransportAdapter("group", "dns-direct-group", nil),
++		answer:           "5.6.7.8",
++		member:           member.Tag(),
++	}
++	manager := &fakeDNSTransportManager{transports: map[string]adapter.DNSTransport{member.Tag(): member, group.Tag(): group}}
++	ctx := service.ContextWith[adapter.DNSTransportManager](context.Background(), manager)
++	client := museTestClient(ctx, true)
++	_, err := client.Exchange(context.Background(), group, museQuestion("f.example"), adapter.DNSQueryOptions{}, nil)
++	require.NoError(t, err)
++	queries := collector.all()
++	require.Len(t, queries, 1)
++	require.Equal(t, "dns-direct-group-1", queries[0].Server)
++	require.Equal(t, "dns-direct-group", queries[0].Group)
++	require.Equal(t, "tcp", queries[0].ServerType)
++	require.Equal(t, "tcp://119.29.29.29", queries[0].Address)
++	require.Equal(t, []string{"5.6.7.8"}, queries[0].Answers)
++}
++
++func TestMuseQueryHookInstalledMidQuerySkipped(t *testing.T) {
++	SetMuseQueryHook(nil)
++	collector := &museCollector{}
++	client := museTestClient(context.Background(), true)
++	// a query that began before recording started has no start time and is not reported
++	client.museRecord(context.Background(), time.Time{}, newMuseTestTransport("udp", "x", "1.1.1.1", 0), mDNS.Question{Name: "g.example.", Qtype: mDNS.TypeA}, nil, false, false, nil)
++	SetMuseQueryHook(collector.hook)
++	defer SetMuseQueryHook(nil)
++	client.museRecord(context.Background(), time.Time{}, newMuseTestTransport("udp", "x", "1.1.1.1", 0), mDNS.Question{Name: "g.example.", Qtype: mDNS.TypeA}, nil, false, false, nil)
++	require.Empty(t, collector.all())
++}
++
++func TestMuseQueryClearOnlyOwnHook(t *testing.T) {
++	first := &museCollector{}
++	SetMuseQueryHook(first.hook)
++	own := LoadMuseQueryHook()
++	second := &museCollector{}
++	SetMuseQueryHook(second.hook)
++	require.False(t, ClearMuseQueryHook(own), "a newer hook is kept")
++	require.True(t, ClearMuseQueryHook(LoadMuseQueryHook()))
++	require.Nil(t, LoadMuseQueryHook())
++}
++
++func TestMuseFormatAddress(t *testing.T) {
++	require.Equal(t, "223.5.5.5", museFormatAddress("223.5.5.5", 0, "udp"))
++	require.Equal(t, "223.5.5.5", museFormatAddress("223.5.5.5", 53, "udp"))
++	require.Equal(t, "223.5.5.5:5353", museFormatAddress("223.5.5.5", 5353, "udp"))
++	require.Equal(t, "tcp://119.29.29.29", museFormatAddress("119.29.29.29", 0, "tcp"))
++	require.Equal(t, "tls://8.8.8.8", museFormatAddress("8.8.8.8", 853, "tls"))
++	require.Equal(t, "https://dns.google", museFormatAddress("dns.google", 443, "https"))
++	require.Equal(t, "[2400:3200::1]", museFormatAddress("2400:3200::1", 0, "udp"))
++	require.Equal(t, "", museFormatAddress("", 0, "local"))
++}
+diff --git a/dns/transport/group.go b/dns/transport/group.go
+index 102279799..3ce8a8ac1 100644
+--- a/dns/transport/group.go
++++ b/dns/transport/group.go
+@@ -153,12 +153,14 @@ func (c *groupCollector) add(ctx context.Context, r groupResult, keepFirstErr bo
+ 	response, filtered := c.transport.filterIgnored(r.response)
+ 	if len(response.Answer) > 0 {
+ 		c.transport.logger.DebugContext(ctx, "response from ", r.tag)
++		dns.MuseNoteServer(ctx, r.tag)
+ 		return response, true
+ 	}
+ 	if filtered {
+ 		c.transport.logger.DebugContext(ctx, "ignored response from ", r.tag)
+ 	} else if c.fallback == nil {
+ 		c.fallback = response
++		dns.MuseNoteServer(ctx, r.tag)
+ 	}
+ 	return nil, false
+ }
+diff --git a/dns/transport_adapter.go b/dns/transport_adapter.go
+index 7d2ebfa7e..eea7ca0b4 100644
+--- a/dns/transport_adapter.go
++++ b/dns/transport_adapter.go
+@@ -9,6 +9,7 @@ type TransportAdapter struct {
+ 	transportTag  string
+ 	dependencies  []string
+ 	references    []string
++	museAddress   string
+ }
+ 
+ func NewTransportAdapter(transportType string, transportTag string, dependencies []string) TransportAdapter {
+@@ -50,6 +51,7 @@ func NewTransportAdapterWithRemoteOptions(transportType string, transportTag str
+ 		transportTag:  transportTag,
+ 		dependencies:  dependencies,
+ 		references:    references,
++		museAddress:   museFormatAddress(remoteOptions.Server, remoteOptions.ServerPort, transportType),
+ 	}
+ }
+ 
+diff --git a/experimental/clashapi/dns.go b/experimental/clashapi/dns.go
+index 4f850f828..80a21f622 100644
+--- a/experimental/clashapi/dns.go
++++ b/experimental/clashapi/dns.go
+@@ -13,9 +13,11 @@ import (
+ 	"github.com/miekg/dns"
+ )
+ 
+-func dnsRouter(router adapter.DNSRouter) http.Handler {
++func dnsRouter(router adapter.DNSRouter, ctx context.Context, recorder *museDNSRecorder) http.Handler {
+ 	r := chi.NewRouter()
+ 	r.Get("/query", queryDNS(router))
++	r.Get("/queries", museDNSQueries(ctx, recorder))
++	r.Delete("/queries", museClearDNSQueries(recorder))
+ 	return r
+ }
+ 
+diff --git a/experimental/clashapi/muse_dns.go b/experimental/clashapi/muse_dns.go
+new file mode 100644
+index 000000000..1dff299f9
+--- /dev/null
++++ b/experimental/clashapi/muse_dns.go
+@@ -0,0 +1,260 @@
++package clashapi
++
++// 穿云 core: DNS query view.
++//
++//   GET    /dns/queries   websocket: first frame = buffered queries (oldest first),
++//                         then one frame per batch of new queries; plain GET = snapshot
++//   DELETE /dns/queries   clear the buffer
++//
++// Queries are recorded only while at least one websocket is open: the first
++// subscriber installs the DNS client hook, the last one removes it. The buffer is a
++// fixed ring (museDNSCapacity) kept for the next subscriber.
++
++import (
++	"bytes"
++	"context"
++	"net/http"
++	"sync"
++	"time"
++
++	"github.com/sagernet/sing-box/dns"
++	"github.com/sagernet/sing/common/json"
++	"github.com/sagernet/ws"
++	"github.com/sagernet/ws/wsutil"
++
++	"github.com/go-chi/render"
++)
++
++const (
++	museDNSCapacity      = 500
++	museDNSSubscriberBuf = 256
++)
++
++// MuseDNSQuery is the wire form of one query.
++type MuseDNSQuery struct {
++	ID         uint64   `json:"id"`
++	Time       int64    `json:"time"` // unix milliseconds
++	Domain     string   `json:"domain"`
++	Type       string   `json:"type"`
++	Server     string   `json:"server"`
++	ServerType string   `json:"serverType,omitempty"`
++	Address    string   `json:"address,omitempty"`
++	Group      string   `json:"group,omitempty"`
++	Answers    []string `json:"answers"`
++	Rcode      string   `json:"rcode,omitempty"`
++	Elapsed    float64  `json:"elapsed"` // milliseconds
++	Cached     bool     `json:"cached"`
++	Optimistic bool     `json:"optimistic,omitempty"`
++	Error      string   `json:"error,omitempty"`
++}
++
++type museDNSSubscriber struct {
++	ch chan MuseDNSQuery
++}
++
++type museDNSRecorder struct {
++	access      sync.Mutex
++	ring        []MuseDNSQuery
++	next        int
++	full        bool
++	nextID      uint64
++	subscribers map[*museDNSSubscriber]struct{}
++	hook        *dns.MuseQueryHook
++}
++
++func newMuseDNSRecorder(capacity int) *museDNSRecorder {
++	return &museDNSRecorder{
++		ring:        make([]MuseDNSQuery, capacity),
++		subscribers: make(map[*museDNSSubscriber]struct{}),
++	}
++}
++
++func (r *museDNSRecorder) record(query *dns.MuseQuery) {
++	r.access.Lock()
++	defer r.access.Unlock()
++	if len(r.subscribers) == 0 {
++		return
++	}
++	r.nextID++
++	answers := query.Answers
++	if answers == nil {
++		answers = []string{}
++	}
++	item := MuseDNSQuery{
++		ID:         r.nextID,
++		Time:       query.Time.UnixMilli(),
++		Domain:     query.Domain,
++		Type:       query.Type,
++		Server:     query.Server,
++		ServerType: query.ServerType,
++		Address:    query.Address,
++		Group:      query.Group,
++		Answers:    answers,
++		Rcode:      query.Rcode,
++		Elapsed:    float64(query.Duration.Microseconds()) / 1000,
++		Cached:     query.Cached,
++		Optimistic: query.Optimistic,
++		Error:      query.Error,
++	}
++	r.ring[r.next] = item
++	r.next++
++	if r.next == len(r.ring) {
++		r.next = 0
++		r.full = true
++	}
++	for subscriber := range r.subscribers {
++		select {
++		case subscriber.ch <- item:
++		default: // slow reader: drop rather than block DNS
++		}
++	}
++}
++
++// snapshot returns buffered queries, oldest first.
++func (r *museDNSRecorder) snapshot() []MuseDNSQuery {
++	r.access.Lock()
++	defer r.access.Unlock()
++	return r.snapshotLocked()
++}
++
++func (r *museDNSRecorder) snapshotLocked() []MuseDNSQuery {
++	var out []MuseDNSQuery
++	if r.full {
++		out = make([]MuseDNSQuery, 0, len(r.ring))
++		out = append(out, r.ring[r.next:]...)
++		out = append(out, r.ring[:r.next]...)
++	} else {
++		out = make([]MuseDNSQuery, r.next)
++		copy(out, r.ring[:r.next])
++	}
++	return out
++}
++
++func (r *museDNSRecorder) clear() {
++	r.access.Lock()
++	defer r.access.Unlock()
++	for i := range r.ring {
++		r.ring[i] = MuseDNSQuery{}
++	}
++	r.next = 0
++	r.full = false
++}
++
++// subscribe returns the buffered queries and a live channel. The snapshot and the
++// registration happen under one lock so no query is lost or sent twice.
++func (r *museDNSRecorder) subscribe() (*museDNSSubscriber, []MuseDNSQuery) {
++	r.access.Lock()
++	defer r.access.Unlock()
++	subscriber := &museDNSSubscriber{ch: make(chan MuseDNSQuery, museDNSSubscriberBuf)}
++	r.subscribers[subscriber] = struct{}{}
++	if len(r.subscribers) == 1 {
++		dns.SetMuseQueryHook(r.record)
++		r.hook = dns.LoadMuseQueryHook()
++	}
++	return subscriber, r.snapshotLocked()
++}
++
++func (r *museDNSRecorder) unsubscribe(subscriber *museDNSSubscriber) {
++	r.access.Lock()
++	defer r.access.Unlock()
++	if _, loaded := r.subscribers[subscriber]; !loaded {
++		return
++	}
++	delete(r.subscribers, subscriber)
++	if len(r.subscribers) == 0 && r.hook != nil {
++		dns.ClearMuseQueryHook(r.hook)
++		r.hook = nil
++	}
++}
++
++// close drops every subscriber and removes the hook (server shutdown).
++func (r *museDNSRecorder) close() {
++	r.access.Lock()
++	defer r.access.Unlock()
++	for subscriber := range r.subscribers {
++		delete(r.subscribers, subscriber)
++	}
++	if r.hook != nil {
++		dns.ClearMuseQueryHook(r.hook)
++		r.hook = nil
++	}
++}
++
++func (r *museDNSRecorder) subscriberCount() int {
++	r.access.Lock()
++	defer r.access.Unlock()
++	return len(r.subscribers)
++}
++
++func museDNSQueries(ctx context.Context, recorder *museDNSRecorder) func(w http.ResponseWriter, req *http.Request) {
++	return func(w http.ResponseWriter, req *http.Request) {
++		if req.Header.Get("Upgrade") != "websocket" {
++			render.JSON(w, req, recorder.snapshot())
++			return
++		}
++		conn, _, _, err := ws.UpgradeHTTP(req, w)
++		if err != nil {
++			return
++		}
++		defer conn.Close()
++		subscriber, initial := recorder.subscribe()
++		defer recorder.unsubscribe(subscriber)
++
++		// one reader per open socket: notices the client going away (and answers pings)
++		gone := make(chan struct{})
++		go func() {
++			defer close(gone)
++			for {
++				if _, _, readErr := wsutil.ReadClientData(conn); readErr != nil {
++					return
++				}
++			}
++		}()
++
++		buf := &bytes.Buffer{}
++		send := func(items []MuseDNSQuery) error {
++			buf.Reset()
++			if items == nil {
++				items = []MuseDNSQuery{}
++			}
++			if encodeErr := json.NewEncoder(buf).Encode(items); encodeErr != nil {
++				return encodeErr
++			}
++			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
++			return wsutil.WriteServerText(conn, buf.Bytes())
++		}
++		if send(initial) != nil {
++			return
++		}
++		batch := make([]MuseDNSQuery, 0, 64)
++		for {
++			select {
++			case <-ctx.Done():
++				return
++			case <-gone:
++				return
++			case item := <-subscriber.ch:
++				batch = append(batch[:0], item)
++			drain:
++				for len(batch) < cap(batch) {
++					select {
++					case more := <-subscriber.ch:
++						batch = append(batch, more)
++					default:
++						break drain
++					}
++				}
++				if send(batch) != nil {
++					return
++				}
++			}
++		}
++	}
++}
++
++func museClearDNSQueries(recorder *museDNSRecorder) func(w http.ResponseWriter, req *http.Request) {
++	return func(w http.ResponseWriter, req *http.Request) {
++		recorder.clear()
++		render.NoContent(w, req)
++	}
++}
+diff --git a/experimental/clashapi/muse_dns_test.go b/experimental/clashapi/muse_dns_test.go
+new file mode 100644
+index 000000000..07d166704
+--- /dev/null
++++ b/experimental/clashapi/muse_dns_test.go
+@@ -0,0 +1,154 @@
++package clashapi
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/dns"
++	"github.com/sagernet/ws"
++	"github.com/sagernet/ws/wsutil"
++
++	"github.com/stretchr/testify/require"
++)
++
++func museQuery(domain string) *dns.MuseQuery {
++	return &dns.MuseQuery{
++		Time:     time.UnixMilli(1700000000000),
++		Domain:   domain,
++		Type:     "A",
++		Server:   "dns-direct",
++		Address:  "223.5.5.5",
++		Answers:  []string{"1.2.3.4"},
++		Rcode:    "NOERROR",
++		Duration: 1500 * time.Microsecond,
++	}
++}
++
++func museRecordViaHook(domain string) {
++	if hook := dns.LoadMuseQueryHook(); hook != nil {
++		(*hook)(museQuery(domain))
++	}
++}
++
++func TestMuseDNSRecorderOnlyWhileSubscribed(t *testing.T) {
++	dns.SetMuseQueryHook(nil)
++	recorder := newMuseDNSRecorder(4)
++	require.Nil(t, dns.LoadMuseQueryHook(), "no subscriber -> no hook")
++	recorder.record(museQuery("ignored.example"))
++	require.Empty(t, recorder.snapshot(), "nothing recorded without subscriber")
++
++	first, initial := recorder.subscribe()
++	require.Empty(t, initial)
++	require.NotNil(t, dns.LoadMuseQueryHook())
++	second, _ := recorder.subscribe()
++	recorder.unsubscribe(first)
++	require.NotNil(t, dns.LoadMuseQueryHook(), "hook stays while one subscriber is left")
++	museRecordViaHook("a.example")
++	recorder.unsubscribe(second)
++	require.Nil(t, dns.LoadMuseQueryHook(), "last subscriber removes the hook")
++	recorder.unsubscribe(second) // twice is harmless
++	museRecordViaHook("b.example")
++	snapshot := recorder.snapshot()
++	require.Len(t, snapshot, 1, "buffer kept for the next subscriber")
++	require.Equal(t, "a.example", snapshot[0].Domain)
++}
++
++func TestMuseDNSRecorderRing(t *testing.T) {
++	dns.SetMuseQueryHook(nil)
++	recorder := newMuseDNSRecorder(3)
++	subscriber, _ := recorder.subscribe()
++	defer recorder.unsubscribe(subscriber)
++	for _, domain := range []string{"1", "2", "3", "4", "5"} {
++		recorder.record(museQuery(domain))
++	}
++	snapshot := recorder.snapshot()
++	require.Len(t, snapshot, 3)
++	require.Equal(t, []string{"3", "4", "5"}, []string{snapshot[0].Domain, snapshot[1].Domain, snapshot[2].Domain})
++	require.Equal(t, uint64(5), snapshot[2].ID)
++	require.Equal(t, 1.5, snapshot[2].Elapsed)
++	require.Equal(t, int64(1700000000000), snapshot[2].Time)
++	recorder.clear()
++	require.Empty(t, recorder.snapshot())
++	// a slow reader never blocks DNS: the channel just drops
++	for i := 0; i < museDNSSubscriberBuf+10; i++ {
++		recorder.record(museQuery("flood"))
++	}
++	require.Len(t, subscriber.ch, museDNSSubscriberBuf)
++}
++
++func TestMuseDNSRecorderCloseRemovesHook(t *testing.T) {
++	recorder := newMuseDNSRecorder(3)
++	recorder.subscribe()
++	require.NotNil(t, dns.LoadMuseQueryHook())
++	recorder.close()
++	require.Nil(t, dns.LoadMuseQueryHook())
++	require.Equal(t, 0, recorder.subscriberCount())
++}
++
++func TestMuseDNSWebsocket(t *testing.T) {
++	dns.SetMuseQueryHook(nil)
++	recorder := newMuseDNSRecorder(10)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	server := httptest.NewServer(dnsRouter(nil, ctx, recorder))
++	defer server.Close()
++
++	// seed the buffer through an earlier subscription
++	seed, _ := recorder.subscribe()
++	recorder.record(museQuery("old.example"))
++	recorder.unsubscribe(seed)
++
++	conn, br, _, err := ws.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http")+"/queries")
++	require.NoError(t, err)
++	var reader io.Reader = conn
++	if br != nil { // frames sent right after the handshake may already be buffered
++		reader = br
++	}
++	rw := struct {
++		io.Reader
++		io.Writer
++	}{reader, conn}
++	read := func() []MuseDNSQuery {
++		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
++		data, _, readErr := wsutil.ReadServerData(rw)
++		require.NoError(t, readErr)
++		var items []MuseDNSQuery
++		require.NoError(t, json.Unmarshal(data, &items))
++		return items
++	}
++	initial := read()
++	require.Len(t, initial, 1)
++	require.Equal(t, "old.example", initial[0].Domain)
++	require.Equal(t, []string{"1.2.3.4"}, initial[0].Answers)
++	require.Equal(t, "223.5.5.5", initial[0].Address)
++
++	require.Eventually(t, func() bool { return dns.LoadMuseQueryHook() != nil }, 2*time.Second, 10*time.Millisecond)
++	museRecordViaHook("live.example")
++	live := read()
++	require.Len(t, live, 1)
++	require.Equal(t, "live.example", live[0].Domain)
++
++	// plain GET = snapshot, DELETE clears
++	response, err := http.Get(server.URL + "/queries")
++	require.NoError(t, err)
++	var snapshot []MuseDNSQuery
++	require.NoError(t, json.NewDecoder(response.Body).Decode(&snapshot))
++	response.Body.Close()
++	require.Len(t, snapshot, 2)
++	request, _ := http.NewRequest(http.MethodDelete, server.URL+"/queries", nil)
++	response, err = http.DefaultClient.Do(request)
++	require.NoError(t, err)
++	response.Body.Close()
++	require.Equal(t, http.StatusNoContent, response.StatusCode)
++	require.Empty(t, recorder.snapshot())
++
++	// client goes away -> subscription and hook end
++	conn.Close()
++	require.Eventually(t, func() bool { return recorder.subscriberCount() == 0 && dns.LoadMuseQueryHook() == nil }, 3*time.Second, 10*time.Millisecond)
++}
+diff --git a/experimental/clashapi/server.go b/experimental/clashapi/server.go
+index 0ffff8c1b..600b1aa3b 100644
+--- a/experimental/clashapi/server.go
++++ b/experimental/clashapi/server.go
+@@ -57,6 +57,7 @@ type Server struct {
+ 	clashMode      *clashmode.Manager
+ 	logDebug       bool
+ 	cleaner        *cleanup.Cleaner
++	museDNS        *museDNSRecorder
+ 
+ 	externalController       bool
+ 	externalUI               string
+@@ -93,6 +94,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
+ 		externalUIDownloadURL:    options.ExternalUIDownloadURL,
+ 		externalUIDownloadDetour: options.ExternalUIDownloadDetour,
+ 		cleaner:                  cleanup.Add(trafficManager.Clear),
++		museDNS:                  newMuseDNSRecorder(museDNSCapacity),
+ 	}
+ 	s.urlTestHistory = service.PtrFromContext[urltest.HistoryStorage](ctx)
+ 	if s.urlTestHistory == nil {
+@@ -130,7 +132,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
+ 		r.Mount("/script", scriptRouter())
+ 		r.Mount("/profile", profileRouter())
+ 		r.Mount("/cache", cacheRouter(ctx))
+-		r.Mount("/dns", dnsRouter(s.dnsRouter))
++		r.Mount("/dns", dnsRouter(s.dnsRouter, s.ctx, s.museDNS))
+ 
+ 		s.setupMetaAPI(r)
+ 	})
+@@ -185,6 +187,7 @@ func (s *Server) Start(stage adapter.StartStage) error {
+ }
+ 
+ func (s *Server) Close() error {
++	s.museDNS.close()
+ 	return common.Close(
+ 		common.PtrOrNil(s.httpServer),
+ 		s.trafficManager,

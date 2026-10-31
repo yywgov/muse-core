@@ -71,6 +71,13 @@ jobs:
           for t in ModeChrome ModeFirefox ModeRandomized ModeRandomizedNoALPN ModeCache RetryOtherMode RetryNoAlternate RetryNextConnection VersionBytes VersionInHello; do
             grep -q -- "--- PASS: TestMuseReality$t " /tmp/muse-reality.log || { echo "::error::TestMuseReality$t did not run/pass"; exit 1; }
           done
+          # 穿云 core muse.19: DNS query view (patch 0011) - client hook + local API /dns/queries
+          go test -ldflags=-checklinkname=0 -tags with_clash_api ./dns/ ./experimental/clashapi/ -run 'Muse' -count=1 -v 2>&1 | tee /tmp/muse-dns-view.log | grep -E '^(--- |FAIL|ok|panic)|_test.go'
+          test ${PIPESTATUS[0]} -eq 0
+          for t in MuseQueryNoHookRecordsNothing MuseQueryExchangeAndCacheHit MuseQueryLookupCached MuseQueryErrorAndAsync MuseQueryGroupMember MuseQueryHookInstalledMidQuerySkipped MuseQueryClearOnlyOwnHook MuseFormatAddress MuseDNSRecorderOnlyWhileSubscribed MuseDNSRecorderRing MuseDNSRecorderCloseRemovesHook MuseDNSWebsocket; do
+            grep -q -- "--- PASS: Test$t " /tmp/muse-dns-view.log || { echo "::error::Test$t did not run/pass"; exit 1; }
+          done
+          go test -ldflags=-checklinkname=0 -tags with_clash_api ./dns/ ./dns/transport/ ./experimental/clashapi/ -count=1
 
       - uses: actions/setup-java@v5
         with:
