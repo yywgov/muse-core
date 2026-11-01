@@ -61,7 +61,7 @@ func TestDefaultRulesMainlandDirect(t *testing.T) {
 		"IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
 		"IP-CIDR6,fc00::/7,DIRECT,no-resolve",
 		"RULE-SET,muse-geosite-category-ads-all,REJECT",
-		"RULE-SET,muse-geoip-malware,REJECT",
+		// 1.9.0 #14: geoip-malware is not in the .mrs data (skipped)
 		"RULE-SET,muse-geosite-cn,DIRECT",
 		"RULE-SET,muse-geoip-cn,DIRECT",
 		"DOMAIN-SUFFIX,google.com,select",
@@ -123,7 +123,7 @@ func TestRegionOtherDropsRegionRule(t *testing.T) {
 			t.Fatalf("region rule kept: %v", plan.Rules)
 		}
 	}
-	if len(plan.Rules) != 5 {
+	if len(plan.Rules) != 4 { // 1.9.0 #14: geoip-malware no longer mapped
 		t.Fatalf("%v", plan.Rules)
 	}
 }
@@ -221,5 +221,30 @@ func TestRegionWithoutListLikeMainCore(t *testing.T) {
 		if p := PlanRoutes(nil, r); len(p.Rules) != 0 {
 			t.Fatalf("%q: %v", r, p.Rules)
 		}
+	}
+}
+
+// 穿云 1.9.0 #14: the 去广告 lists the .mrs data does not have are skipped (no download that can only
+// fail on every connect); the rule keeps its other list, and an all-missing rule is dropped.
+func TestMissingListsSkipped(t *testing.T) {
+	base := "https://raw.githubusercontent.com/hiddify/hiddify-geo/rule-set/block/"
+	for _, n := range []string{"geosite-malware", "geosite-phishing", "geosite-cryptominers", "geoip-malware", "geoip-phishing"} {
+		if _, ok := MapRuleSet(base+n+".srs", "cn"); ok {
+			t.Errorf("%s mapped", n)
+		}
+	}
+	if rp, ok := MapRuleSet(base+"geosite-category-ads-all.srs", "cn"); !ok || rp.Name != "muse-geosite-category-ads-all" {
+		t.Errorf("ads %v %v", rp, ok)
+	}
+	rr := &RouteRule{Rules: []AppRule{{Enabled: true, Name: "builtin:blockAds", Outbound: []byte(`"block"`), RuleSets: []string{
+		base + "geosite-category-ads-all.srs", base + "geosite-malware.srs", base + "geoip-phishing.srs",
+	}}}}
+	plan := PlanRoutes(rr, "cn")
+	if len(plan.Providers) != 1 || plan.Providers["muse-geosite-category-ads-all"].URL == "" {
+		t.Fatalf("providers %v", plan.Providers)
+	}
+	only := &RouteRule{Rules: []AppRule{{Enabled: true, Name: "x", Outbound: []byte(`"block"`), RuleSets: []string{base + "geosite-malware.srs"}}}}
+	if p := PlanRoutes(only, "cn"); len(p.Rules) != 0 || len(p.Providers) != 0 {
+		t.Fatalf("all-missing rule kept: %v", p.Rules)
 	}
 }

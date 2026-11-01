@@ -61,6 +61,25 @@ func isSIP008(j []byte) (*sip008, bool) {
 	return &doc, true
 }
 
+// isSIP008List reports whether a JSON array is a bare SIP008 server list (objects with server_port).
+func isSIP008List(j []byte) (*sip008, bool) {
+	var probe []map[string]json.RawMessage
+	if json.Unmarshal(j, &probe) != nil || len(probe) == 0 {
+		return nil, false
+	}
+	if _, ok := probe[0]["server_port"]; !ok {
+		return nil, false
+	}
+	if _, ok := probe[0]["type"]; ok { // a sing-box outbound list, not SIP008
+		return nil, false
+	}
+	var doc sip008
+	if json.Unmarshal(append(append([]byte(`{"servers":`), j...), '}'), &doc) != nil || len(doc.Servers) == 0 {
+		return nil, false
+	}
+	return &doc, true
+}
+
 func parseSIP008(doc *sip008) (*Profile, error) {
 	p := &Profile{Kind: KindSIP008}
 	names := map[string]int{}

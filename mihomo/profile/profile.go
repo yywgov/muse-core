@@ -113,6 +113,12 @@ func Parse(content []byte) (*Profile, error) {
 				return parseSIP008(doc)
 			}
 		}
+		if len(j) > 0 && j[0] == '[' {
+			// 穿云 1.9.0: a bare SIP008 server list ([{"server":…,"server_port":…}]), as the app detects it
+			if doc, ok := isSIP008List(j); ok {
+				return parseSIP008(doc)
+			}
+		}
 		if len(j) > 0 && (j[0] == '{' || j[0] == '[') {
 			return parseSingBoxJSON(j)
 		}

@@ -91,6 +91,14 @@ const GeoDataBase = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/
 // RuleSetInterval is how often a downloaded list is re-checked while connected (the main core: 5 days).
 const RuleSetInterval = 5 * 24 * 3600
 
+// missingLists are lists the app's built-in 去广告 rule names that the .mrs data does not have
+// (checked 2026-11-02: 404). Mapping them made every connect wait for a download that can only
+// fail; they are skipped like any other unmapped list (穿云 1.9.0 #14).
+var missingLists = map[string]bool{
+	"geosite/malware": true, "geosite/phishing": true, "geosite/cryptominers": true,
+	"geoip/malware": true, "geoip/phishing": true,
+}
+
 // RuleProvider is a rule set mapped from the app's rule-set link.
 type RuleProvider struct {
 	Name     string // provider name, "muse-geosite-cn"
@@ -124,7 +132,7 @@ func MapRuleSet(url, region string) (RuleProvider, bool) {
 	default:
 		return RuleProvider{}, false
 	}
-	if name == "" || strings.ContainsAny(name, "/\\ ,()") {
+	if name == "" || strings.ContainsAny(name, "/\\ ,()") || missingLists[kind+"/"+name] {
 		return RuleProvider{}, false
 	}
 	rp := RuleProvider{Name: "muse-" + kind + "-" + name, URL: GeoDataBase + kind + "/" + name + ".mrs", Behavior: "domain"}

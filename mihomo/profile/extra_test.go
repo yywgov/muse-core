@@ -100,3 +100,22 @@ func TestFakeTCPHysteriaNotBuilt(t *testing.T) {
 		t.Error("build tags")
 	}
 }
+
+func TestSIP008BareList(t *testing.T) {
+	p, err := Parse([]byte(`[{"remarks":"日本","server":"jp.example.com","server_port":443,"password":"p","method":"aes-128-gcm"},
+	 {"server":"jp.example.com","server_port":"8443","password":"p","method":"aes-128-gcm"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Kind != KindSIP008 || len(p.Proxies) != 2 || p.Proxies[0]["name"] != "日本" || p.Proxies[1]["port"] != 8443 {
+		t.Fatalf("kind %v proxies %v", p.Kind, p.Proxies)
+	}
+	// a sing-box outbound list (also has server_port) is still read as sing-box JSON
+	q, err := Parse([]byte(`[{"type":"shadowsocks","tag":"a","server":"a.example.com","server_port":8388,"method":"aes-128-gcm","password":"p"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.Kind == KindSIP008 {
+		t.Fatalf("outbound list read as SIP008")
+	}
+}
