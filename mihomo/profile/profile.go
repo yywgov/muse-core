@@ -35,6 +35,9 @@ func (k Kind) String() string {
 	case KindSingBoxJSON:
 		return "singbox-json"
 	}
+	if n, ok := extraKindNames[k]; ok {
+		return n
+	}
 	return "unknown"
 }
 
@@ -86,7 +89,7 @@ var supportedTypes = map[string]bool{
 var trimmedTypes = map[string]bool{"tailscale": true, "zerotier": true, "easytier": true}
 
 // BuildTags are the tags every build of this module uses (CI and the size report).
-const BuildTags = "with_gvisor,no_tailscale,no_zerotier,no_easytier"
+const BuildTags = "with_gvisor,no_tailscale,no_zerotier,no_easytier,no_fake_tcp"
 
 // SupportedType reports whether proxies of type t can run on this build.
 func SupportedType(t string) bool { return supportedTypes[strings.ToLower(t)] }
@@ -98,9 +101,17 @@ func Parse(content []byte) (*Profile, error) {
 	if len(trimmed) == 0 {
 		return nil, ErrEmpty
 	}
+	if isWireGuardConf(trimmed) && !bytes.HasPrefix(trimmed, []byte("{")) {
+		return parseWireGuardConf(trimmed)
+	}
 	if j := trimmed; j[0] == '{' || j[0] == '[' || bytes.HasPrefix(j, []byte("//")) || bytes.HasPrefix(j, []byte("/*")) {
 		if j[0] == '/' {
 			j = bytes.TrimSpace(stripJSONComments(j))
+		}
+		if len(j) > 0 && j[0] == '{' {
+			if doc, ok := isSIP008(j); ok {
+				return parseSIP008(doc)
+			}
 		}
 		if len(j) > 0 && (j[0] == '{' || j[0] == '[') {
 			return parseSingBoxJSON(j)
@@ -142,6 +153,10 @@ func parseClashYAML(content []byte) (*Profile, bool, error) {
 				removed[name] = true
 			case !supportedTypes[typ]:
 				p.Unsupported = append(p.Unsupported, Unsupported{Name: name, Type: typ, Reason: ReasonUnsupportedProtocol})
+				removed[name] = true
+			case typ == "hysteria" && strings.EqualFold(fmt.Sprint(m["protocol"]), "faketcp"):
+				// 穿云 1.9.0: built with no_fake_tcp (Linux-only raw sockets; the main core has no such mode either)
+				p.Unsupported = append(p.Unsupported, Unsupported{Name: name, Type: typ, Reason: ReasonNotBuilt, Detail: "faketcp"})
 				removed[name] = true
 			default:
 				p.Proxies = append(p.Proxies, m)

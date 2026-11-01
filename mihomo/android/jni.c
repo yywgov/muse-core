@@ -40,6 +40,10 @@ JNIEXPORT void JNICALL Java_com_hiddify_hiddify_bg_CompatCore_nativeStop(JNIEnv 
 	museCompatStop();
 }
 
+JNIEXPORT jint JNICALL Java_com_hiddify_hiddify_bg_CompatCore_nativeNetworkChanged(JNIEnv *env, jclass clazz) {
+	return museCompatNetworkChanged();
+}
+
 JNIEXPORT jstring JNICALL Java_com_hiddify_hiddify_bg_CompatCore_nativeVersion(JNIEnv *env, jclass clazz) {
 	return take_string(env, museCompatVersion());
 }

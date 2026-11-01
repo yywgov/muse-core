@@ -153,8 +153,19 @@ func TestServiceStartStopRealEngine(t *testing.T) {
 		t.Errorf("info %+v", info)
 	}
 
+	// 穿云 1.9.0: a network change while running resets connections and keeps the core up
+	if n := svc.NetworkChanged(); n < 0 {
+		t.Errorf("network changed: %d", n)
+	}
+	if !listening(mixed) || svc.State() != hcore.CoreStates_STARTED {
+		t.Error("core must keep running after a network change")
+	}
+
 	if res := svc.StopCore(); res.CoreState != hcore.CoreStates_STOPPED {
 		t.Fatalf("stop: %v", res)
+	}
+	if n := m.NetworkChanged(); n != 0 {
+		t.Errorf("network changed while stopped: %d", n)
 	}
 	waitUntil(t, "mixed port closed", func() bool { return !listening(mixed) })
 	waitUntil(t, "local API closed", func() bool { return !listening(api) })
@@ -269,6 +280,31 @@ func TestRoutedConfigParsesInMihomo(t *testing.T) {
 		}
 		if _, err := m.Parse(buf); err != nil {
 			t.Fatalf("%s: mihomo rejected the routed config: %v\n%s", name, err, buf)
+		}
+	}
+}
+
+// 穿云 1.9.0: SIP008 and WireGuard .conf subscriptions build configs real mihomo accepts.
+func TestExtraFormatsParseInMihomo(t *testing.T) {
+	m := &Mihomo{}
+	m.SetHomeDir(t.TempDir())
+	subs := map[string]string{
+		"sip008": `{"version":1,"servers":[{"remarks":"a","server":"127.0.0.1","server_port":8388,"password":"p","method":"aes-256-gcm"},` +
+			`{"remarks":"b","server":"127.0.0.1","server_port":8389,"password":"p","method":"aes-128-gcm","plugin":"obfs-local","plugin_opts":"obfs=http;obfs-host=x.example"}]}`,
+		"wireguard": "[Interface]\nPrivateKey = eCtXsJZ27+4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU=\nAddress = 10.8.0.2/32, fd00::2/128\nDNS = 1.1.1.1\nMTU = 1280\n" +
+			"[Peer]\nPublicKey = Cr8hWlKvtDt7nrvf+f0brNQQzabAqrjfBvas9pmowjo=\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 127.0.0.1:51820\nPersistentKeepalive = 25\n",
+	}
+	for name, sub := range subs {
+		p, err := profile.Parse([]byte(sub))
+		if err != nil || len(p.Proxies) == 0 {
+			t.Fatalf("%s: %v %v", name, err, p)
+		}
+		buf, err := options.Build(p, options.Defaults(), options.Runtime{ControllerAddr: "127.0.0.1:0", Secret: "x"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.Parse(buf); err != nil {
+			t.Fatalf("%s: mihomo rejected the config: %v\n%s", name, err, buf)
 		}
 	}
 }

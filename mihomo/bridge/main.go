@@ -7,7 +7,7 @@
 // Build (CI, MinGW):
 //
 //	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
-//	  go build -buildmode=c-shared -trimpath -tags with_gvisor,no_tailscale,no_zerotier,no_easytier \
+//	  go build -buildmode=c-shared -trimpath -tags with_gvisor,no_tailscale,no_zerotier,no_easytier,no_fake_tcp \
 //	  -ldflags "-s -w -buildid=" -o muse-mihomo.dll ./bridge
 package main
 

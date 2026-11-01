@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub"
@@ -144,3 +145,25 @@ func (m *Mihomo) SubscribeLogs() (<-chan grpcsvc.LogEvent, func()) {
 
 // Version is mihomo's version string (set at link time).
 func (m *Mihomo) Version() string { return C.Version }
+
+// NetworkChanged is called when the device's default network changed (Wi-Fi ↔ mobile data, or
+// back after an outage). Connections opened on the old network would hang until their own
+// timeouts, and cached DNS answers may point at the old network's view, so both are dropped;
+// the next request dials again on the new network. Returns how many connections were closed.
+// Does nothing while stopped. 穿云 1.9.0.
+func (m *Mihomo) NetworkChanged() int {
+	m.mu.Lock()
+	running := m.running
+	m.mu.Unlock()
+	if !running {
+		return 0
+	}
+	resolver.ClearCache()
+	closed := 0
+	statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
+		_ = c.Close()
+		closed++
+		return true
+	})
+	return closed
+}

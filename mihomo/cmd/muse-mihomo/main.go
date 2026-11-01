@@ -2,7 +2,7 @@
 // (no cgo). Used for local runs and for measuring the size of a build on any target:
 //
 //	CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -trimpath \
-//	  -tags with_gvisor,no_tailscale,no_zerotier,no_easytier -ldflags "-s -w -buildid=" ./cmd/muse-mihomo
+//	  -tags with_gvisor,no_tailscale,no_zerotier,no_easytier,no_fake_tcp -ldflags "-s -w -buildid=" ./cmd/muse-mihomo
 package main
 
 import (

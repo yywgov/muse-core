@@ -8,7 +8,7 @@
 // Build (CI, NDK):
 //
 //	CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang \
-//	  go build -buildmode=c-shared -trimpath -tags with_gvisor,no_tailscale,no_zerotier,no_easytier \
+//	  go build -buildmode=c-shared -trimpath -tags with_gvisor,no_tailscale,no_zerotier,no_easytier,no_fake_tcp \
 //	  -ldflags "-s -w -buildid=" -o libmusecompat.so ./android
 //
 // JNI entry points (class com.hiddify.hiddify.bg.CompatCore) are in jni.c.
@@ -61,6 +61,12 @@ func museCompatStop() {
 	svc.SetTunFD(0)
 	debug.FreeOSMemory()
 }
+
+// museCompatNetworkChanged: the VPN service saw the default network change (穿云 1.9.0); drops
+// stale connections and cached DNS answers. Returns how many connections were closed.
+//
+//export museCompatNetworkChanged
+func museCompatNetworkChanged() C.int { return C.int(svc.NetworkChanged()) }
 
 //export museCompatVersion
 func museCompatVersion() *C.char { return C.CString((&engine.Mihomo{}).Version()) }

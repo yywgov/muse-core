@@ -450,3 +450,38 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+type netFake struct {
+	*fakeEngine
+	changes int
+}
+
+func (n *netFake) NetworkChanged() int { n.changes++; return 2 }
+
+// 穿云 1.9.0: a network change reaches the engine only while the core runs, and engines that do
+// not watch the network are left alone.
+func TestNetworkChangedOnlyWhileStarted(t *testing.T) {
+	n := &netFake{fakeEngine: newFake()}
+	s := New(n)
+	dir := t.TempDir()
+	s.Prepare(dir)
+	if got := s.NetworkChanged(); got != 0 || n.changes != 0 {
+		t.Fatalf("stopped: %d %d", got, n.changes)
+	}
+	path := writeProfile(t, dir, links)
+	if res := s.StartCore(&hcore.StartRequest{ConfigPath: path}); res.CoreState != hcore.CoreStates_STARTED {
+		t.Fatalf("start %v", res)
+	}
+	if got := s.NetworkChanged(); got != 2 || n.changes != 1 {
+		t.Errorf("started: %d %d", got, n.changes)
+	}
+	s.StopCore()
+	if got := s.NetworkChanged(); got != 0 || n.changes != 1 {
+		t.Errorf("after stop: %d %d", got, n.changes)
+	}
+	plain := New(newFake())
+	plain.Prepare(t.TempDir())
+	if got := plain.NetworkChanged(); got != 0 {
+		t.Errorf("plain engine: %d", got)
+	}
+}

@@ -53,6 +53,27 @@ type Engine interface {
 	Reload(parsed any)
 }
 
+// NetworkWatcher is implemented by engines that drop stale connections when the device's
+// network changes (穿云 1.9.0; the Android VPN service reports changes from its network callback).
+type NetworkWatcher interface {
+	NetworkChanged() int
+}
+
+// NetworkChanged tells the engine the default network changed. It is a no-op while the core is
+// not running or when the engine does not care. Returns how many connections were dropped.
+func (s *Service) NetworkChanged() int {
+	if s.State() != hcore.CoreStates_STARTED {
+		return 0
+	}
+	w, ok := s.eng.(NetworkWatcher)
+	if !ok {
+		return 0
+	}
+	n := w.NetworkChanged()
+	s.log(hcore.LogLevel_INFO, fmt.Sprintf("network changed: %d connection(s) reset", n))
+	return n
+}
+
 // Service implements hcore.CoreServer.
 type Service struct {
 	hcore.UnimplementedCoreServer
