@@ -1,6 +1,6 @@
 module github.com/yywgov/muse-core/mihomo
 
-go 1.26.3
+go 1.26.10
 
 require (
 	github.com/metacubex/mihomo v1.19.33

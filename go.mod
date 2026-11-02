@@ -1,6 +1,6 @@
 module github.com/hiddify/hiddify-core
 
-go 1.26.3
+go 1.26.10
 
 require (
 	github.com/bepass-org/warp-plus v1.2.6
