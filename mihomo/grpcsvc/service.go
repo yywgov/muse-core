@@ -97,6 +97,7 @@ type Service struct {
 	nodesHub   *hub[bool] // true: the node list changed; false: the core stopped
 	testMu     sync.Mutex
 	testing    map[string]bool
+	retrying   map[string]bool // 穿云 1.10.3: first test failed, re-test pending
 
 	// GroupsDebounce batches node-list changes (delay results arrive one by one), like the main core.
 	GroupsDebounce time.Duration
@@ -173,6 +174,7 @@ func New(eng Engine) *Service {
 		StateResync:        2 * time.Second,
 		nodesHub:           newHub[bool](),
 		testing:            map[string]bool{},
+		retrying:           map[string]bool{},
 		GroupsDebounce:     time.Second,
 		SysProxy:           sysproxy.Default,
 	}

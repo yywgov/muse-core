@@ -34,7 +34,8 @@ type fakeEngine struct {
 	nodes    map[string]NodeInfo
 	tested   []string
 	reloads  int
-	testGate chan struct{} // when set, TestDelay waits on it
+	testGate chan struct{}  // when set, TestDelay waits on it
+	fail     map[string]int // 穿云 1.10.3: TestDelay of a node fails this many times first
 }
 
 func newFake() *fakeEngine { return &fakeEngine{logs: make(chan LogEvent, 8)} }
@@ -101,6 +102,12 @@ func (f *fakeEngine) TestDelay(ctx context.Context, name, url string, timeout ti
 	defer f.mu.Unlock()
 	f.tested = append(f.tested, name+"@"+url)
 	n := f.nodes[name]
+	if f.fail[name] > 0 {
+		f.fail[name]--
+		n.Delay, n.Tested = DelayFailed, time.Unix(1700000000, 0)
+		f.nodes[name] = n
+		return 0, errors.New("timeout")
+	}
 	n.Delay, n.Tested = uint16(100+len(f.tested)), time.Unix(1700000000, 0)
 	f.nodes[name] = n
 	return n.Delay, nil

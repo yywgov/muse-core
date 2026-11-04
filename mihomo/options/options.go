@@ -44,8 +44,8 @@ type Settings struct {
 	MTU             uint32   `json:"mtu"`
 	StrictRoute     bool     `json:"strict-route"`
 	BypassLAN       bool     `json:"bypass-lan"`
-	TestWorkers     int      `json:"muse-test-workers"`    // 4–64, 0 = 16 (same as the main core)
-	TestTimeoutMs   int      `json:"muse-test-timeout-ms"` // 0 = 5000
+	TestWorkers     int      `json:"muse-test-workers"`    // 4–64, 0 = 8 (same as the main core, 穿云 1.10.3)
+	TestTimeoutMs   int      `json:"muse-test-timeout-ms"` // 0 = 8000 (穿云 1.10.3)
 	// M3-4: routing like the main core (rules.go): the region ("cn": mainland direct) and the
 	// app's rule list. Kept raw: a list this core cannot read never fails the settings.
 	Region       string          `json:"region"`
@@ -65,7 +65,7 @@ func (s Settings) Routes() (RoutePlan, error) {
 func (s Settings) Workers() int {
 	switch {
 	case s.TestWorkers <= 0:
-		return 16
+		return 8 // 穿云 1.10.3: was 16 (too many connections at once on congested home lines)
 	case s.TestWorkers < 4:
 		return 4
 	case s.TestWorkers > 64:
@@ -77,7 +77,7 @@ func (s Settings) Workers() int {
 // TestTimeout is the limit of one delay test.
 func (s Settings) TestTimeout() time.Duration {
 	if s.TestTimeoutMs <= 0 {
-		return 5 * time.Second
+		return 8 * time.Second // 穿云 1.10.3: was 5 s
 	}
 	return time.Duration(s.TestTimeoutMs) * time.Millisecond
 }

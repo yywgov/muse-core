@@ -307,3 +307,57 @@ func TestHotReload(t *testing.T) {
 		t.Errorf("reload after restart %v", r)
 	}
 }
+
+// 穿云 1.10.3: a failed test is repeated once after the batch; meanwhile the node shows as not
+// tested yet, and only a second failure is shown as failed.
+func TestUrlTestRetriesFailedOnce(t *testing.T) {
+	old := RetestAfter
+	RetestAfter = 50 * time.Millisecond
+	defer func() { RetestAfter = old }()
+	s, f := startedWithNodes(t)
+	ctx := context.Background()
+	f.mu.Lock()
+	f.fail = map[string]int{"A": 1, "B": 5}
+	f.testGate = make(chan struct{})
+	f.mu.Unlock()
+	if r, err := s.UrlTest(ctx, &hcore.UrlTestRequest{Tag: "select"}); err != nil || r.Code != hcommon.ResponseCode_OK {
+		t.Fatalf("%v %v", r, err)
+	}
+	// first round: both fail; while the re-test is pending neither shows as failed
+	f.testGate <- struct{}{}
+	f.testGate <- struct{}{}
+	waitFor(t, func() bool {
+		s.testMu.Lock()
+		defer s.testMu.Unlock()
+		return s.retrying["A"] && s.retrying["B"]
+	})
+	for _, it := range s.GroupList(false).Items[0].Items {
+		if (it.Tag == "A" || it.Tag == "B") && (it.UrlTestDelay != 0 || it.UrlTestTime != nil) {
+			t.Errorf("%s shown as %d while its re-test is pending", it.Tag, it.UrlTestDelay)
+		}
+	}
+	if !s.Testing() {
+		t.Error("still testing while re-tests are pending")
+	}
+	close(f.testGate)
+	waitFor(t, func() bool { return !s.Testing() })
+	got := waitTested(t, f, 4)
+	if len(got) != 4 {
+		t.Fatalf("tested %v, want each node twice", got)
+	}
+	nodes := map[string]int32{}
+	for _, it := range s.GroupList(false).Items[0].Items {
+		nodes[it.Tag] = it.UrlTestDelay
+	}
+	if d := nodes["A"]; d == 0 || d >= DelayFailed {
+		t.Errorf("A answered its re-test, got %d", d)
+	}
+	if nodes["B"] != DelayFailed {
+		t.Errorf("B failed twice, got %d", nodes["B"])
+	}
+	s.testMu.Lock()
+	defer s.testMu.Unlock()
+	if len(s.retrying) != 0 || len(s.testing) != 0 {
+		t.Errorf("left %v / %v", s.retrying, s.testing)
+	}
+}

@@ -1,0 +1,264 @@
+穿云 core muse.21: 测速 on congested home lines (China Mobile home broadband).
+Many working nodes showed 超时. A thorough test opened a warm-up probe and then 5 probes at
+once per node with 16 workers (up to ~80 new connections at the same moment); lines with
+per-user session limits / QoS dropped part of them, and the 5 s default timeout left no room
+for one lost packet on a slow route. Now: 8 workers by default, 3 concurrent samples, 8 s
+default probe timeout (the app sends its own values), and a node without a good value that
+fails is reported as 0 ("still testing") and re-tested once 3 s later (one probe, full
+timeout, queued behind the running test) before it is reported timed out.
+
+diff --git a/common/monitoring/h_monitoring_test.go b/common/monitoring/h_monitoring_test.go
+index 372b57af8..60d485f15 100644
+--- a/common/monitoring/h_monitoring_test.go
++++ b/common/monitoring/h_monitoring_test.go
+@@ -347,7 +347,7 @@ func TestH_MonitoringCycleEndToEnd(t *testing.T) {
+ 	require.Eventually(t, func() bool {
+ 		h := m.OutboundsHistory("grp")
+ 		return h["good"].Delay > 0 && h["good"].Delay < TimeoutDelay && h["bad"].Delay == TimeoutDelay
+-	}, 4*time.Second, 10*time.Millisecond)
++	}, 4*time.Second+museRetestFirstFailAfter, 10*time.Millisecond) // 穿云 1.10.3: "bad" is re-tested once first
+ 	require.Equal(t, uint32(1), m.currentLinkIndex.Load(), "switches to the next URL when every test of a stage fails")
+ 	require.Eventually(t, func() bool { return cache.LoadBinary("outbound_monitoring_history") != nil }, 2*time.Second, 10*time.Millisecond)
+ 	require.NoError(t, m.UnsubscribeGroup("grp", events))
+diff --git a/common/monitoring/muse_latency.go b/common/monitoring/muse_latency.go
+index d59dfbfdb..0a708b3c0 100644
+--- a/common/monitoring/muse_latency.go
++++ b/common/monitoring/muse_latency.go
+@@ -18,7 +18,9 @@ import (
+ )
+ 
+ const (
+-	museThoroughSamples = 5
++	// 穿云 1.10.3: 3 probes at once (1.2.5 had 5): fewer simultaneous connections per node, see
++	// defaultWorkerCount
++	museThoroughSamples = 3
+ 	// 穿云 1.2.5: samples kept per node across tests (the shown value is their median), and how
+ 	// long a sample stays relevant
+ 	museSampleWindow = 6
+@@ -28,7 +30,10 @@ const (
+ 	// periodic failures in a row before a node with a good value counts as timed out
+ 	museFailuresToTimeout = 2
+ 	museRetestAfter       = 10 * time.Second
+-	museMinProbeTimeout   = 3 * time.Second
++	// 穿云 1.10.3: a node without a good value that fails is tested once more this soon (one probe
++	// with the full timeout, queued behind the running 测速) before it is reported as timed out
++	museRetestFirstFailAfter = 3 * time.Second
++	museMinProbeTimeout      = 3 * time.Second
+ )
+ 
+ type museLatency struct {
+@@ -85,6 +90,13 @@ func (l *museLatency) apply(thorough bool, ok bool, delay uint16) (report uint16
+ 	case ok:
+ 		l.value, l.fails = museSmooth(l.value, delay), 0
+ 		l.addSamples(time.Now(), delay)
++	case !good && l.fails == 0 && (thorough || l.value == 0):
++		// 穿云 1.10.3: a node without a good value (never measured, or timed out before) that
++		// fails a 测速 is tested once more before it counts as timed out: report 0 ("still
++		// testing", the app keeps showing 测速中) and re-test shortly, off the busy moment of the
++		// batch. Lost probes on a congested home line no longer show 超时 on the first try.
++		l.value, l.fails, l.samples = 0, 1, nil
++		retest = true
+ 	case !good:
+ 		// 穿云 1.2.5: a thorough test failing on a node that was working also gets one more
+ 		// chance (a lost probe on a mobile network), so one tap no longer shows 超时 by mistake
+@@ -150,13 +162,22 @@ func museProbeMedian(probe func(time.Duration) (uint16, error), timeout time.Dur
+ 	return medianDelay(ok), nil
+ }
+ 
+-// scheduleRetest tests a node again shortly after its first periodic failure.
+-func (m *OutboundMonitoring) scheduleRetest(tag string) {
++// museRetestDelay: how soon a failed node is tested again — a node that never had a good value
++// sooner (the user is waiting for its first result) than a working one after a periodic miss.
++func museRetestDelay(hadGoodValue bool) time.Duration {
++	if hadGoodValue {
++		return museRetestAfter
++	}
++	return museRetestFirstFailAfter
++}
++
++// scheduleRetest tests a node again shortly after its first failure.
++func (m *OutboundMonitoring) scheduleRetest(tag string, after time.Duration) {
+ 	go func() {
+ 		select {
+ 		case <-m.ctx.Done():
+ 			return
+-		case <-time.After(museRetestAfter):
++		case <-time.After(after):
+ 		}
+ 		m.enqueueTask(&testTask{outboundTag: tag, cycleID: m.cycleSeq + 1_000_000})
+ 	}()
+diff --git a/common/monitoring/muse_latency_test.go b/common/monitoring/muse_latency_test.go
+index d2596557a..c92dcf00e 100644
+--- a/common/monitoring/muse_latency_test.go
++++ b/common/monitoring/muse_latency_test.go
+@@ -30,10 +30,63 @@ func TestMuseLatencyThoroughSetsMedian(t *testing.T) {
+ 	require.True(t, retest)
+ 	r, _ = l.apply(true, false, TimeoutDelay)
+ 	require.Equal(t, TimeoutDelay, r, "second failure in a row: timed out")
+-	// a node that never worked times out at once
++	// 穿云 1.10.3: a node that never worked is re-tested once before it times out
+ 	var fresh museLatency
+-	r, _ = fresh.apply(true, false, TimeoutDelay)
++	r, retest = fresh.apply(true, false, TimeoutDelay)
++	require.Equal(t, uint16(0), r, "first failure: still testing")
++	require.True(t, retest)
++	r, retest = fresh.apply(false, false, TimeoutDelay)
++	require.Equal(t, TimeoutDelay, r, "the re-test failed too: timed out")
++	require.False(t, retest)
++}
++
++// 穿云 1.10.3: one lost 测速 on a congested line no longer shows 超时 — the re-test decides.
++func TestMuseLatencyFirstFailureRetestsOnce(t *testing.T) {
++	// never measured: the re-test answers
++	var l museLatency
++	r, retest := l.apply(true, false, TimeoutDelay)
++	require.Equal(t, uint16(0), r)
++	require.True(t, retest)
++	r, retest = l.apply(false, true, 820)
++	require.Equal(t, uint16(820), r, "slow but working: the delay, not 超时")
++	require.False(t, retest)
++	require.Equal(t, 0, l.fails)
++
++	// timed out in an earlier 测速: one more chance when the user tests again
++	l = museLatency{value: TimeoutDelay}
++	r, retest = l.apply(true, false, TimeoutDelay)
++	require.Equal(t, uint16(0), r)
++	require.True(t, retest)
++	r, retest = l.apply(false, false, TimeoutDelay)
++	require.Equal(t, TimeoutDelay, r)
++	require.False(t, retest)
++
++	// a periodic miss of a node that already timed out stays timed out (no endless re-tests)
++	r, retest = l.apply(false, false, TimeoutDelay)
++	require.Equal(t, TimeoutDelay, r)
++	require.False(t, retest)
++
++	// the user taps 测速 again while the re-test is pending: that failure decides
++	l = museLatency{}
++	l.apply(true, false, TimeoutDelay)
++	r, retest = l.apply(true, false, TimeoutDelay)
+ 	require.Equal(t, TimeoutDelay, r)
++	require.False(t, retest)
++}
++
++func TestMuseRetestDelay(t *testing.T) {
++	require.Equal(t, museRetestAfter, museRetestDelay(true))
++	require.Equal(t, museRetestFirstFailAfter, museRetestDelay(false))
++	require.Less(t, museRetestFirstFailAfter, museRetestAfter)
++}
++
++// 穿云 1.10.3: at most workers × (1 + samples) connections at once during 测速 (was 16 × 6).
++func TestMuseTestConcurrencyBudget(t *testing.T) {
++	require.Equal(t, 8, defaultWorkerCount)
++	require.Equal(t, 8, MuseClampWorkers(0))
++	require.Equal(t, 3, museThoroughSamples)
++	require.LessOrEqual(t, defaultWorkerCount*museThoroughSamples, 24)
++	require.Equal(t, 8*time.Second, defaultURLTestTimeout)
+ }
+ 
+ // 穿云 1.2.5: repeated 测速 taps refine one value instead of jumping between readings.
+@@ -45,7 +98,7 @@ func TestMuseLatencyRepeatedTapsAreSteady(t *testing.T) {
+ 	require.Equal(t, uint16(400), r) // median of {500, 300}
+ 	r, _ = l.apply(true, true, 320)
+ 	require.Equal(t, uint16(320), r) // median of {500, 300, 320}
+-	r, _ = l.apply(true, true, 900) // one bad reading barely moves it
++	r, _ = l.apply(true, true, 900)  // one bad reading barely moves it
+ 	require.Equal(t, uint16(410), r) // median of {500, 300, 320, 900}
+ 	// old samples age out
+ 	l.samples[0].at = time.Now().Add(-2 * museSampleMaxAge)
+@@ -79,8 +132,11 @@ func TestMuseLatencyPeriodicFailureKeepsGoodValue(t *testing.T) {
+ 	r, retest = l.apply(false, false, TimeoutDelay)
+ 	require.Equal(t, TimeoutDelay, r, "two failures in a row: timed out")
+ 	require.False(t, retest)
+-	// without a good value a failure is a timeout right away
++	// 穿云 1.10.3: a node never measured gets one re-test, then times out
+ 	var fresh museLatency
++	r, retest = fresh.apply(false, false, TimeoutDelay)
++	require.Equal(t, uint16(0), r)
++	require.True(t, retest)
+ 	r, _ = fresh.apply(false, false, TimeoutDelay)
+ 	require.Equal(t, TimeoutDelay, r)
+ }
+diff --git a/common/monitoring/muse_parallel.go b/common/monitoring/muse_parallel.go
+index 3f51e8c7f..bf7059197 100644
+--- a/common/monitoring/muse_parallel.go
++++ b/common/monitoring/muse_parallel.go
+@@ -2,7 +2,8 @@ package monitoring
+ 
+ // muse (穿云 1.4.0): faster 测速 over dozens of nodes (Cloudflare 优选 lists of 50+ entries kept
+ // many rows at 「测速中」 for a minute):
+-//   - 16 test workers instead of 10 (the app can set 4–64);
++//   - 16 test workers instead of 10 (the app can set 4–64; 穿云 1.10.3: default 8, see
++//     defaultWorkerCount);
+ //   - a 测速 the user asked for is queued with priority, ahead of the periodic cycle;
+ //   - after a lost warm-up probe the samples get a short timeout, so a dead node holds a worker
+ //     about timeout + 3 s instead of twice the timeout;
+diff --git a/common/monitoring/muse_parallel_test.go b/common/monitoring/muse_parallel_test.go
+index 091da1d5b..b27516d11 100644
+--- a/common/monitoring/muse_parallel_test.go
++++ b/common/monitoring/muse_parallel_test.go
+@@ -6,7 +6,7 @@ import (
+ )
+ 
+ func TestMuseClampWorkers(t *testing.T) {
+-	cases := map[int]int{0: 16, -1: 16, 1: 4, 16: 16, 32: 32, 500: 64}
++	cases := map[int]int{0: 8, -1: 8, 1: 4, 8: 8, 16: 16, 32: 32, 500: 64} // 穿云 1.10.3: default 8
+ 	for in, want := range cases {
+ 		if got := MuseClampWorkers(in); got != want {
+ 			t.Fatalf("MuseClampWorkers(%d) = %d, want %d", in, got, want)
+diff --git a/common/monitoring/outbound_monitoring.go b/common/monitoring/outbound_monitoring.go
+index 27b2fa290..1e06afecd 100644
+--- a/common/monitoring/outbound_monitoring.go
++++ b/common/monitoring/outbound_monitoring.go
+@@ -34,9 +34,15 @@ var _ adapter.LifecycleService = (*OutboundMonitoring)(nil)
+ var _ adapter.InterfaceUpdateListener = (*OutboundMonitoring)(nil)
+ 
+ const (
+-	defaultWorkerCount    = 16 // muse (穿云 1.4.0): was 10; dozens of CF nodes queued too long
++	// muse (穿云 1.10.3): 8 (1.4.0 had 16). Each worker opens a warm-up probe and then
++	// museThoroughSamples probes at once, so 16 workers meant up to 80 new connections at the same
++	// time; home broadband with per-user session limits / QoS (China Mobile) dropped part of them
++	// and working nodes showed 超时. The app sends its own value (default 8).
++	defaultWorkerCount    = 8
+ 	defaultDebounceWindow = 500 * time.Millisecond
+-	defaultURLTestTimeout = 5 * time.Second
++	// muse (穿云 1.10.3): 8 s (was 5 s) — a node on a slow, lossy route needs DNS, TCP, TLS and
++	// the request; one lost packet adds a 1–3 s retransmission, which 5 s did not leave room for.
++	defaultURLTestTimeout = 8 * time.Second
+ 	defaultIdleTimeout    = 10 * time.Minute
+ 	defaultInterval       = 5 * time.Minute
+ 	defaultURLTest        = "https://www.gstatic.com/generate_204"
+@@ -359,6 +365,7 @@ func (m *OutboundMonitoring) signalChange(outboundTag string, visited map[string
+ 		m.signalChange(dependent, visited)
+ 	}
+ }
++
+ // TestNow is a test the user asked for (测速): muse — every node gets the thorough test
+ // (one warm-up probe, then three probes; the median is kept).
+ func (m *OutboundMonitoring) TestNow(outboundTag string) error {
+@@ -804,10 +811,11 @@ func (m *OutboundMonitoring) applyResult(outcome testOutcome) *adapter.URLTestHi
+ 	// median, a periodic sample is smoothed into it, and a single periodic failure keeps a good
+ 	// value (and re-tests soon) instead of reporting the node dead at once.
+ 	okSample := outcome.err == nil && outcome.history.Delay > 0 && outcome.history.Delay < TimeoutDelay
++	hadGood := state.latency.value > 0 && state.latency.value < TimeoutDelay
+ 	reported, retest := state.latency.apply(outcome.thorough, okSample, outcome.history.Delay)
+ 	outcome.history.Delay = reported
+ 	if retest {
+-		m.scheduleRetest(outcome.outboundTag)
++		m.scheduleRetest(outcome.outboundTag, museRetestDelay(hadGood))
+ 	}
+ 	if okSample || reported >= TimeoutDelay {
+ 		state.invalid = !okSample
+diff --git a/protocol/group/balancer/h_balancer_test.go b/protocol/group/balancer/h_balancer_test.go
+index 8bc484473..bfcf38e9f 100644
+--- a/protocol/group/balancer/h_balancer_test.go
++++ b/protocol/group/balancer/h_balancer_test.go
+@@ -166,6 +166,8 @@ func TestH_BalancerFailoverViaMonitoring(t *testing.T) {
+ 	require.NoError(t, monitor.Start(adapter.StartStatePostStart))
+ 
+ 	require.Eventually(t, func() bool { return lb.Now() == "b" }, 4*time.Second, 20*time.Millisecond)
++	// 穿云 1.10.3: "a" is re-tested once (shows 0 meanwhile) before it is reported timed out
++	require.Eventually(t, func() bool { return monitor.OutboundsHistory("lb")["a"].Delay == monitoring.TimeoutDelay }, 6*time.Second, 20*time.Millisecond)
+ 	history := monitor.OutboundsHistory("lb")
+ 	require.Equal(t, monitoring.TimeoutDelay, history["a"].Delay)
+ 	require.Greater(t, history["b"].Delay, uint16(0))

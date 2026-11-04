@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yywgov/muse-core/mihomo/profile"
 	"go.yaml.in/yaml/v3"
@@ -215,5 +216,20 @@ func TestBuildTunDevice(t *testing.T) {
 	}
 	if tun := get(Runtime{TunDevice: "Chuanyun", TunFD: 7}); tun["device"] != nil || tun["file-descriptor"] != 7 {
 		t.Fatalf("fd tun %v", tun)
+	}
+}
+
+// 穿云 1.10.3: defaults like the main core — 8 tests at once, 8 s per test.
+func TestTestDefaults1103(t *testing.T) {
+	var s Settings
+	if s.Workers() != 8 {
+		t.Errorf("workers %d", s.Workers())
+	}
+	if s.TestTimeout() != 8*time.Second {
+		t.Errorf("timeout %v", s.TestTimeout())
+	}
+	s.TestWorkers, s.TestTimeoutMs = 32, 3000
+	if s.Workers() != 32 || s.TestTimeout() != 3*time.Second {
+		t.Errorf("app values not kept: %d %v", s.Workers(), s.TestTimeout())
 	}
 }

@@ -61,8 +61,12 @@ jobs:
       - name: Muse sing-box tests (monitoring / balancer)
         working-directory: hiddify-sing-box
         run: |
-          go test -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_utls,with_clash_api ./common/monitoring/ ./protocol/group/balancer/ -count=1 -v 2>&1 | grep -E '^(=== RUN|--- |PASS|FAIL|ok|panic)|_test.go|muse timing'
+          go test -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_utls,with_clash_api ./common/monitoring/ ./protocol/group/balancer/ -count=1 -v 2>&1 | tee /tmp/muse-monitoring.log | grep -E '^(=== RUN|--- |PASS|FAIL|ok|panic)|_test.go|muse timing'
           test ${PIPESTATUS[0]} -eq 0
+          # 穿云 core muse.21: congested home lines - 8 workers, 3 samples, 8 s, one re-test before 超时 (patch 0012)
+          for t in MuseLatencyFirstFailureRetestsOnce MuseRetestDelay MuseTestConcurrencyBudget MuseClampWorkers MuseLatencyThoroughSetsMedian H_BalancerFailoverViaMonitoring; do
+            grep -q -- "--- PASS: Test$t " /tmp/muse-monitoring.log || { echo "::error::Test$t did not run/pass"; exit 1; }
+          done
           # 穿云 core muse.15/16: REALITY key share by fingerprint (chrome PQ, firefox/randomized X25519)
           # + one retry with the other mode, cached per server (patches 0008, 0009)
           # 穿云 core muse.17: client version 26.10.21 in the session ID (patch 0010)

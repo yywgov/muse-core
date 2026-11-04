@@ -91,6 +91,7 @@ func (s *Service) GroupList(onlyMain bool) *hcore.OutboundGroupList {
 		return list
 	}
 	nodes := s.eng.Nodes()
+	s.hideRetrying(nodes)
 	for _, name := range order {
 		n, ok := nodes[name]
 		if !ok || !n.Group || n.Hidden {
@@ -242,8 +243,14 @@ func (s *Service) UrlTestActive(ctx context.Context, _ *hcommon.Empty) (*hcommon
 	return ok()
 }
 
+// RetestAfter: how long after a batch its failed nodes are tested once more (穿云 1.10.3).
+var RetestAfter = 2 * time.Second
+
 // startTests runs delay tests in the background with the configured parallelism; a node already
 // being tested is skipped. Each result marks the node list changed.
+// 穿云 1.10.3: a node whose test fails is tested once more after the batch (fewer connections
+// open then) before its failure is shown: lost probes on a congested home line (China Mobile)
+// showed working nodes as 超时. Until the second test answers, the node shows as not tested yet.
 func (s *Service) startTests(targets []string) {
 	s.mu.Lock()
 	st := s.settings
@@ -260,33 +267,71 @@ func (s *Service) startTests(targets []string) {
 	if len(todo) == 0 {
 		return
 	}
-	workers := st.Workers()
-	if workers > len(todo) {
-		workers = len(todo)
+	url, timeout, workers := st.URL(), st.TestTimeout(), st.Workers()
+	go func() {
+		failed := s.runTests(todo, workers, url, timeout, true)
+		if len(failed) > 0 {
+			time.Sleep(RetestAfter)
+			s.runTests(failed, workers, url, timeout, false)
+		}
+	}()
+}
+
+// runTests tests [names] with at most [workers] at once and returns the ones that failed. With
+// [retryLater] a failed node stays marked as being tested (and its failure hidden) for the
+// re-test; otherwise every node is done when its test returns.
+func (s *Service) runTests(names []string, workers int, url string, timeout time.Duration, retryLater bool) []string {
+	if workers > len(names) {
+		workers = len(names)
 	}
-	url, timeout := st.URL(), st.TestTimeout()
 	jobs := make(chan string)
-	var wg sync.WaitGroup
+	var (
+		wg     sync.WaitGroup
+		failMu sync.Mutex
+		failed []string
+	)
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for name := range jobs {
-				_, _ = s.eng.TestDelay(context.Background(), name, url, timeout)
+				_, err := s.eng.TestDelay(context.Background(), name, url, timeout)
 				s.testMu.Lock()
-				delete(s.testing, name)
+				if err != nil && retryLater {
+					s.retrying[name] = true
+				} else {
+					delete(s.testing, name)
+					delete(s.retrying, name)
+				}
 				s.testMu.Unlock()
+				if err != nil {
+					failMu.Lock()
+					failed = append(failed, name)
+					failMu.Unlock()
+				}
 				s.nodesHub.publish(true)
 			}
 		}()
 	}
-	go func() {
-		for _, t := range todo {
-			jobs <- t
+	for _, n := range names {
+		jobs <- n
+	}
+	close(jobs)
+	wg.Wait()
+	return failed
+}
+
+// hideRetrying shows a node whose first test failed and that waits for its re-test as not tested
+// yet (no delay, no time) instead of failed.
+func (s *Service) hideRetrying(nodes map[string]NodeInfo) {
+	s.testMu.Lock()
+	defer s.testMu.Unlock()
+	for name := range s.retrying {
+		if n, ok := nodes[name]; ok && n.Delay == DelayFailed {
+			n.Delay, n.Tested = 0, time.Time{}
+			nodes[name] = n
 		}
-		close(jobs)
-		wg.Wait()
-	}()
+	}
 }
 
 // Testing reports whether any delay test is running.
