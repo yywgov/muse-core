@@ -62,7 +62,8 @@ jobs:
                    GroupsSelectTestReloadRealEngine SystemProxyFollowsStartStop TunFileDescriptorFromService SystemProxyServerAndBypass BuildTunDevice \
                    ParseKeepsBodyAsIs ParseBadBodyKeepsOldProfile ParseContentAndRender StartWithSavedClashBody \
                    MapRuleSet DefaultRulesMainlandDirect GlobalModeListHasNoMainlandDirect RegionOtherDropsRegionRule \
-                   UserRulesAndQualifiers BadRouteRuleIgnored PortPayload RoutedConfigParsesInMihomo RegionWithoutListLikeMainCore; do
+                   UserRulesAndQualifiers BadRouteRuleIgnored PortPayload RoutedConfigParsesInMihomo RegionWithoutListLikeMainCore \
+                   UrlTestRetriesFailedOnce FirstTryTimeoutAndKinds TestGateAdapts CompatTieredAndAdaptive; do
             grep -q -- "--- PASS: Test$t " /tmp/mihomo-test.log || { echo "::error::Test$t did not run/pass"; exit 1; }
           done
 

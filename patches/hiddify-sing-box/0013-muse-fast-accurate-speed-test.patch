@@ -1,0 +1,2041 @@
+穿云 core muse.22 (1.10.4): 测速 faster and more accurate without the false 超时 of congested
+home lines coming back.
+- One connection per node: connect + TLS + the first HEAD, then up to three HEAD round trips on
+  the same kept-alive connection; the median of those (no handshake in it) is the delay, the
+  first one is shown at once (urltest.MuseURLTestSamples). 1 connection instead of 4. When the
+  server does not keep the connection, one new connection; with no round trip at all the setup
+  time is used (a node that answered is never 超时 because a second request failed).
+- Timeout tiers: the first try gets 5 s (5/8 of the timeout, 3–5 s) with a second connection
+  after 2.5 s without an answer; connection refused / no such host is final at once; a real
+  timeout is re-tested 1 s later, ahead of the queue, with three connections and the full timeout.
+- Adaptive concurrency: from the configured count (8) +4 after each round without a timeout up
+  to 3× (24); three timeouts among the last 8 results drop it back; a network change resets it.
+  At most 24 test connections are open at once (1.10.3's 8 × 3); extra ones only within it.
+- Nodes with exactly the same configuration (MonitoringOptions.MuseSameAs) are tested once and
+  share the result (off after a hot reload); an automatic test reuses a result younger than 60 s,
+  测速 / re-tests / invalidated nodes always test.
+
+diff --git a/common/monitoring/h_registry.go b/common/monitoring/h_registry.go
+index 5f7e6635c..e1d24eff1 100644
+--- a/common/monitoring/h_registry.go
++++ b/common/monitoring/h_registry.go
+@@ -108,6 +108,9 @@ func (m *OutboundMonitoring) Reload() error {
+ 		return err
+ 	}
+ 	m.registry.Store(registry)
++	// muse (穿云 1.10.4): the outbounds changed — nodes no longer share results until the next
++	// start (the shared map was made for the old configuration)
++	m.museSame.Store(newMuseSameAs(nil))
+ 	if m.started {
+ 		for tag, grp := range registry.groups {
+ 			if _, existed := previous.groups[tag]; !existed {
+diff --git a/common/monitoring/muse_fast.go b/common/monitoring/muse_fast.go
+new file mode 100644
+index 000000000..e3e28ce9f
+--- /dev/null
++++ b/common/monitoring/muse_fast.go
+@@ -0,0 +1,292 @@
++package monitoring
++
++// muse (穿云 1.10.4): 测速 faster and more accurate without bringing back the false 超时 of
++// congested home lines (1.10.3).
++//
++//   - One connection per node (see urltest.MuseURLTestSamples): setup, then up to three round
++//     trips on the kept-alive connection; the first is shown at once, the others refine it. The
++//     shown value is the median of the reused round trips (no handshake in it).
++//   - Two timeout tiers: the first test of a node gets 5 s (5/8 of the configured timeout); a
++//     connection refused / a server name that does not exist fails at once and is final; only a
++//     real timeout is tested again — 1 s later, ahead of the queue, with the full timeout and
++//     three connections at once — before 超时 is shown. A node is 超时 only after both tiers.
++//   - Adaptive concurrency: starts at the configured count (8) and grows by 4 after each round
++//     without a timeout, up to 3× (24); several timeouts among the last results drop it back to
++//     the configured count. 24 single-connection tests open no more connections at once than
++//     1.10.3's 8 workers × 3 probes.
++//   - Nodes with exactly the same configuration (only the name differs) are tested once and
++//     share the result.
++//   - A result younger than 60 s is reused by automatic tests; a 测速 the user asks for always
++//     tests again.
++
++import (
++	"context"
++	"errors"
++	"net"
++	"strings"
++	"sync"
++	"syscall"
++	"time"
++)
++
++const (
++	museFirstTierMin   = 3 * time.Second
++	museFirstTierMax   = 5 * time.Second
++	museRetestBackoff  = 1 * time.Second
++	museRetestParallel = 3
++	museHedgeAfter     = 2500 * time.Millisecond
++	museFreshFor       = 60 * time.Second
++	museGateCeiling    = 24
++	museGateStep       = 4
++	museGateWindow     = 8
++	museGateSlowToDrop = 3
++	museSamplesFast    = 3 // round trips per thorough test on the reused connection
++)
++
++// museResultKind is what one test attempt came to.
++type museResultKind int
++
++const (
++	museResultOK   museResultKind = iota
++	museResultFast                // failed at once: refused, no such host — final
++	museResultSlow                // no answer in time (or a failure that may pass): tested again
++)
++
++// museFirstTierTimeout: the setup timeout of a node's first test.
++func museFirstTierTimeout(full time.Duration) time.Duration {
++	t := full * 5 / 8
++	if t < museFirstTierMin {
++		t = museFirstTierMin
++	}
++	if t > museFirstTierMax {
++		t = museFirstTierMax
++	}
++	if t > full {
++		t = full
++	}
++	return t
++}
++
++// museSampleTimeout bounds one round trip on the kept-alive connection: half the full timeout,
++// at least museMinProbeTimeout.
++func museSampleTimeout(full time.Duration) time.Duration {
++	t := full / 2
++	if t < museMinProbeTimeout {
++		t = museMinProbeTimeout
++	}
++	if t > full {
++		t = full
++	}
++	return t
++}
++
++// museFastFailure: errors that say the node cannot answer, with no packet loss involved.
++func museFastFailure(err error) bool {
++	if err == nil {
++		return false
++	}
++	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
++		return false
++	}
++	if errors.Is(err, syscall.ECONNREFUSED) {
++		return true
++	}
++	var dnsErr *net.DNSError
++	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
++		return true
++	}
++	s := strings.ToLower(err.Error())
++	if strings.Contains(s, "timeout") || strings.Contains(s, "deadline") {
++		return false
++	}
++	return strings.Contains(s, "connection refused") || strings.Contains(s, "no such host") ||
++		strings.Contains(s, "nxdomain")
++}
++
++func museKindOf(err error, delay uint16) museResultKind {
++	switch {
++	case err == nil && delay > 0 && delay < TimeoutDelay:
++		return museResultOK
++	case museFastFailure(err):
++		return museResultFast
++	default:
++		return museResultSlow
++	}
++}
++
++// museGateMax is the most tests at once the gate grows to from [base].
++func museGateMax(base int) int {
++	m := base * 3
++	if m > museGateCeiling {
++		m = museGateCeiling
++	}
++	if m < base {
++		m = base
++	}
++	return m
++}
++
++// museConnBudget: test connections open at once — 1.10.3's 8 workers × 3 probes (24), or the
++// worker count the user picked when that is higher. Extra connections (a hedge, the three tries
++// of a re-test) only start within it.
++func museConnBudget(base int) int {
++	if base > museGateCeiling {
++		return base
++	}
++	return museGateCeiling
++}
++
++// museGate limits how many tests run at once and adapts the limit (AIMD-like: +4 after a round
++// without a timeout, back to base after several timeouts close together).
++type museGate struct {
++	mu      sync.Mutex
++	base    int
++	max     int
++	limit   int
++	inUse   int
++	streak  int
++	recent  []bool // last results, true = timed out
++	wake    chan struct{}
++	peakUse int // for tests
++}
++
++func newMuseGate(base int) *museGate {
++	return &museGate{base: base, max: museGateMax(base), limit: base, wake: make(chan struct{})}
++}
++
++func (g *museGate) acquire(ctx context.Context) bool {
++	for {
++		g.mu.Lock()
++		if g.inUse < g.limit {
++			g.inUse++
++			if g.inUse > g.peakUse {
++				g.peakUse = g.inUse
++			}
++			g.mu.Unlock()
++			return true
++		}
++		wake := g.wake
++		g.mu.Unlock()
++		select {
++		case <-ctx.Done():
++			return false
++		case <-wake:
++		}
++	}
++}
++
++// release frees a slot; [counted] = a test ran and [kind] is how it ended.
++func (g *museGate) release(counted bool, kind museResultKind) {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	g.inUse--
++	if counted {
++		g.observe(kind)
++	}
++	close(g.wake)
++	g.wake = make(chan struct{})
++}
++
++func (g *museGate) observe(kind museResultKind) {
++	slow := kind == museResultSlow
++	g.recent = append(g.recent, slow)
++	if len(g.recent) > museGateWindow {
++		g.recent = g.recent[len(g.recent)-museGateWindow:]
++	}
++	if slow {
++		g.streak = 0
++		n := 0
++		for _, s := range g.recent {
++			if s {
++				n++
++			}
++		}
++		if n >= museGateSlowToDrop && g.limit > g.base {
++			g.limit = g.base
++			g.recent = nil
++		}
++		return
++	}
++	g.streak++
++	if g.streak >= g.limit && g.limit < g.max {
++		g.limit += museGateStep
++		if g.limit > g.max {
++			g.limit = g.max
++		}
++		g.streak = 0
++	}
++}
++
++// reset: a new network starts again from the configured count.
++func (g *museGate) reset() {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	g.limit, g.streak, g.recent = g.base, 0, nil
++}
++
++func (g *museGate) currentLimit() int {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	return g.limit
++}
++
++// museSameAs maps a node to the node with the same configuration that is tested for it.
++type museSameAs struct {
++	primary map[string]string   // duplicate -> primary
++	mirrors map[string][]string // primary -> duplicates
++}
++
++func newMuseSameAs(sameAs map[string]string) *museSameAs {
++	s := &museSameAs{primary: map[string]string{}, mirrors: map[string][]string{}}
++	for dup, p := range sameAs {
++		if dup == "" || p == "" || dup == p {
++			continue
++		}
++		if _, chained := sameAs[p]; chained {
++			continue // a primary is never a duplicate itself
++		}
++		s.primary[dup] = p
++		s.mirrors[p] = append(s.mirrors[p], dup)
++	}
++	return s
++}
++
++func (m *OutboundMonitoring) sameAs() *museSameAs {
++	if s := m.museSame.Load(); s != nil {
++		return s
++	}
++	return &museSameAs{}
++}
++
++// primaryOf is the node tested for [tag].
++func (m *OutboundMonitoring) primaryOf(tag string) string {
++	if p, ok := m.sameAs().primary[tag]; ok && m.getState(p) != nil {
++		return p
++	}
++	return tag
++}
++
++// museFresh: an automatic test of this node can reuse its result.
++func museFresh(state *outboundState, now time.Time) bool {
++	v := state.latency.value
++	return !state.invalid && !state.from_cache && v > 0 && v < TimeoutDelay &&
++		!state.history.Time.IsZero() && now.Sub(state.history.Time) < museFreshFor
++}
++
++// applyInterim shows the first round trip of a thorough test at once (refined by the final result).
++func (m *OutboundMonitoring) applyInterim(tag string, sample uint16) {
++	for _, t := range append([]string{tag}, m.sameAs().mirrors[tag]...) {
++		state := m.getState(t)
++		if state == nil {
++			continue
++		}
++		state.mu.Lock()
++		state.history.Delay = state.latency.preview(sample)
++		state.history.Time = time.Now()
++		state.from_cache = false
++		m.history.StoreURLTestHistory(t, &state.history)
++		groups := state.groupTags
++		state.mu.Unlock()
++		m.emitGroupEvent(groups)
++	}
++}
+diff --git a/common/monitoring/muse_fast_test.go b/common/monitoring/muse_fast_test.go
+new file mode 100644
+index 000000000..2983f0947
+--- /dev/null
++++ b/common/monitoring/muse_fast_test.go
+@@ -0,0 +1,394 @@
++package monitoring
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/urltest"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestMuseFirstTierTimeout(t *testing.T) {
++	require.Equal(t, 5*time.Second, museFirstTierTimeout(8*time.Second))
++	require.Equal(t, 5*time.Second, museFirstTierTimeout(10*time.Second))
++	require.Equal(t, 3125*time.Millisecond, museFirstTierTimeout(5*time.Second))
++	require.Equal(t, 2*time.Second, museFirstTierTimeout(2*time.Second), "never longer than the full timeout")
++	require.Equal(t, 4*time.Second, museSampleTimeout(8*time.Second))
++	require.Equal(t, museMinProbeTimeout, museSampleTimeout(4*time.Second))
++}
++
++func TestMuseFastFailure(t *testing.T) {
++	require.True(t, museFastFailure(errors.New("dial tcp 1.2.3.4:443: connect: connection refused")))
++	require.True(t, museFastFailure(fmt.Errorf("wrap: %w", syscall.ECONNREFUSED)))
++	require.True(t, museFastFailure(&net.DNSError{Err: "no such host", Name: "x.invalid", IsNotFound: true}))
++	require.True(t, museFastFailure(errors.New("lookup x.invalid: no such host")))
++	require.False(t, museFastFailure(context.DeadlineExceeded))
++	require.False(t, museFastFailure(errors.New("i/o timeout")))
++	require.False(t, museFastFailure(errors.New("connection reset by peer")), "a reset may be a lossy line: tested again")
++	require.False(t, museFastFailure(errors.New("EOF")))
++	require.False(t, museFastFailure(nil))
++	require.Equal(t, museResultOK, museKindOf(nil, 120))
++	require.Equal(t, museResultSlow, museKindOf(nil, TimeoutDelay))
++	require.Equal(t, museResultFast, museKindOf(errors.New("connection refused"), 0))
++}
++
++// The adaptive gate: +4 after a round without a timeout, up to 24; three timeouts close together
++// drop it to the configured count; a network change starts again from it.
++func TestMuseGateAdapts(t *testing.T) {
++	g := newMuseGate(8)
++	require.Equal(t, 8, g.currentLimit())
++	require.Equal(t, 24, g.max)
++	for i := 0; i < 8; i++ {
++		g.observe(museResultOK)
++	}
++	require.Equal(t, 12, g.currentLimit())
++	for i := 0; i < 12+16+20; i++ {
++		g.observe(museResultOK)
++	}
++	require.Equal(t, 24, g.currentLimit())
++	for i := 0; i < 50; i++ {
++		g.observe(museResultOK)
++	}
++	require.Equal(t, 24, g.currentLimit(), "never above 3× / 24")
++	// refused nodes are not congestion
++	for i := 0; i < 10; i++ {
++		g.observe(museResultFast)
++	}
++	require.Equal(t, 24, g.currentLimit())
++	// one timeout here and there keeps the limit
++	g.observe(museResultSlow)
++	for i := 0; i < 8; i++ {
++		g.observe(museResultOK)
++	}
++	g.observe(museResultSlow)
++	require.Equal(t, 24, g.currentLimit())
++	// timeouts close together: back to 8
++	g.observe(museResultSlow)
++	g.observe(museResultOK)
++	g.observe(museResultSlow)
++	require.Equal(t, 8, g.currentLimit())
++	g.limit = 20
++	g.reset()
++	require.Equal(t, 8, g.currentLimit())
++
++	require.Equal(t, 12, museGateMax(4))
++	require.Equal(t, 24, museGateMax(16))
++	require.Equal(t, 32, museGateMax(32), "a higher count the user picked is kept")
++	require.Equal(t, 32, museConnBudget(32))
++}
++
++func TestMuseGateLimitsConcurrency(t *testing.T) {
++	g := newMuseGate(4)
++	var running, peak atomic.Int32
++	var wg sync.WaitGroup
++	for i := 0; i < 40; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			require.True(t, g.acquire(context.Background()))
++			n := running.Add(1)
++			for {
++				p := peak.Load()
++				if n <= p || peak.CompareAndSwap(p, n) {
++					break
++				}
++			}
++			time.Sleep(2 * time.Millisecond)
++			running.Add(-1)
++			g.release(true, museResultOK)
++		}()
++	}
++	wg.Wait()
++	require.LessOrEqual(t, int(peak.Load()), 12)
++	require.Greater(t, int(peak.Load()), 4, "grew after rounds without a timeout")
++	ctx, cancel := context.WithCancel(context.Background())
++	g2 := newMuseGate(4)
++	for i := 0; i < 4; i++ {
++		require.True(t, g2.acquire(ctx))
++	}
++	cancel()
++	require.False(t, g2.acquire(ctx), "a full gate gives up when the monitor stops")
++}
++
++// 穿云 1.10.4 museLatency.applyKind: refused = final at once; a first-try timeout = 0 + re-test;
++// the re-test decides.
++func TestMuseLatencyApplyKind(t *testing.T) {
++	var l museLatency
++	r, retest := l.applyKind(true, museResultFast, TimeoutDelay, false)
++	require.Equal(t, TimeoutDelay, r, "refused: 超时 at once")
++	require.False(t, retest)
++
++	l = museLatency{}
++	r, retest = l.applyKind(true, museResultSlow, TimeoutDelay, false)
++	require.Equal(t, uint16(0), r, "timed out on the first try: still testing")
++	require.True(t, retest)
++	r, retest = l.applyKind(true, museResultOK, 640, true)
++	require.Equal(t, uint16(640), r, "the slow node answered the re-test")
++	require.False(t, retest)
++
++	l = museLatency{}
++	l.applyKind(true, museResultSlow, TimeoutDelay, false)
++	r, retest = l.applyKind(true, museResultSlow, TimeoutDelay, true)
++	require.Equal(t, TimeoutDelay, r)
++	require.False(t, retest)
++
++	// a working node keeps its value on one failed 测速 and is re-tested
++	l = museLatency{value: 200}
++	r, retest = l.applyKind(true, museResultSlow, TimeoutDelay, false)
++	require.Equal(t, uint16(200), r)
++	require.True(t, retest)
++
++	// preview does not keep the sample
++	l = museLatency{}
++	l.applyKind(true, museResultOK, 300, false)
++	require.Equal(t, uint16(200), l.preview(100)) // median of {300, 100}
++	require.Len(t, l.samples, 1)
++}
++
++func TestMuseRace(t *testing.T) {
++	// hedge: a second try only when the first has no answer yet
++	var tries atomic.Int32
++	s, err := museRace(context.Background(), nil, 2, 30*time.Millisecond, func(ctx context.Context, answered func()) ([]uint16, error) {
++		if tries.Add(1) == 1 {
++			<-ctx.Done() // a lost SYN
++			return nil, ctx.Err()
++		}
++		answered()
++		return []uint16{120}, nil
++	})
++	require.NoError(t, err)
++	require.Equal(t, []uint16{120}, s)
++	require.Equal(t, int32(2), tries.Load())
++
++	tries.Store(0)
++	_, err = museRace(context.Background(), nil, 2, 20*time.Millisecond, func(ctx context.Context, answered func()) ([]uint16, error) {
++		tries.Add(1)
++		answered()
++		time.Sleep(60 * time.Millisecond) // samples still running
++		return []uint16{90}, nil
++	})
++	require.NoError(t, err)
++	require.Equal(t, int32(1), tries.Load(), "answered in time: no second connection")
++
++	// refused: one try, fast failure
++	tries.Store(0)
++	_, err = museRace(context.Background(), nil, 2, 20*time.Millisecond, func(ctx context.Context, answered func()) ([]uint16, error) {
++		tries.Add(1)
++		return nil, errors.New("connection refused")
++	})
++	require.True(t, museFastFailure(err))
++	require.Equal(t, int32(1), tries.Load())
++
++	// all at once, but only within the token budget
++	tokens := make(chan struct{}, 2)
++	tries.Store(0)
++	_, err = museRace(context.Background(), tokens, 3, 0, func(ctx context.Context, answered func()) ([]uint16, error) {
++		tries.Add(1)
++		return nil, context.DeadlineExceeded
++	})
++	require.Error(t, err)
++	require.False(t, museFastFailure(err))
++	require.Equal(t, int32(2), tries.Load(), "a third connection would exceed the budget")
++	require.Len(t, tokens, 0, "tokens are given back")
++}
++
++type museTestNodes struct {
++	server  *httptest.Server
++	addr    M.Socksaddr
++	dials   sync.Map // tag -> *atomic.Int32
++	open    atomic.Int32
++	peak    atomic.Int32
++	dialer  net.Dialer
++	connect time.Duration
++}
++
++func newMuseTestNodes(t *testing.T) *museTestNodes {
++	n := &museTestNodes{connect: 30 * time.Millisecond}
++	n.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		require.Equal(t, http.MethodHead, r.Method)
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	t.Cleanup(n.server.Close)
++	n.addr = M.ParseSocksaddr(n.server.Listener.Addr().String())
++	return n
++}
++
++func (n *museTestNodes) count(tag string) int32 {
++	v, _ := n.dials.LoadOrStore(tag, new(atomic.Int32))
++	return v.(*atomic.Int32).Load()
++}
++
++type countedConn struct {
++	net.Conn
++	once sync.Once
++	n    *museTestNodes
++}
++
++func (c *countedConn) Close() error {
++	c.once.Do(func() { c.n.open.Add(-1) })
++	return c.Conn.Close()
++}
++
++// good: answers; blackhole: never answers; refused: refused at once; flaky: first connection lost
++func (n *museTestNodes) node(tag, behaviour string) *fakeOutbound {
++	var flaky atomic.Int32
++	return &fakeOutbound{tag: tag, dial: func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++		if destination != n.addr {
++			return nil, errors.New("unreachable") // the exit-IP lookup
++		}
++		v, _ := n.dials.LoadOrStore(tag, new(atomic.Int32))
++		v.(*atomic.Int32).Add(1)
++		switch behaviour {
++		case "refused":
++			return nil, errors.New("dial tcp 203.0.113.1:443: connect: connection refused")
++		case "blackhole":
++			<-ctx.Done()
++			return nil, ctx.Err()
++		case "flaky":
++			if flaky.Add(1) == 1 {
++				<-ctx.Done()
++				return nil, ctx.Err()
++			}
++		}
++		select {
++		case <-time.After(n.connect):
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		}
++		c, err := n.dialer.DialContext(ctx, network, n.addr.String())
++		if err != nil {
++			return nil, err
++		}
++		o := n.open.Add(1)
++		for {
++			p := n.peak.Load()
++			if o <= p || n.peak.CompareAndSwap(p, o) {
++				break
++			}
++		}
++		return &countedConn{Conn: c, n: n}, nil
++	}}
++}
++
++func museUnifiedMonitor(t *testing.T, options option.MonitoringOptions, outbounds ...adapter.Outbound) *OutboundMonitoring {
++	m := newTestMonitor(t, nil, options, outbounds...)
++	m.ctx = urltest.ContextWithIsUnifiedDelay(m.ctx)
++	require.NoError(t, m.Start(adapter.StartStateInitialize))
++	require.NoError(t, m.Start(adapter.StartStatePostStart))
++	return m
++}
++
++// End to end: refused is 超时 at once without a re-test; a node that never answers shows 0 after
++// the first tier, is re-tested with three connections and the full timeout, then 超时; a node
++// whose first connection is lost answers (hedge or re-test) and is never 超时; one connection per
++// working node.
++func TestMuseTieredTestEndToEnd(t *testing.T) {
++	n := newMuseTestNodes(t)
++	good, refused, hole, flaky := n.node("good", "good"), n.node("refused", "refused"), n.node("hole", "blackhole"), n.node("flaky", "flaky")
++	grp := &fakeGroup{fakeOutbound: fakeOutbound{tag: "grp"}, all: []string{"good", "refused", "hole", "flaky"}}
++	m := museUnifiedMonitor(t, option.MonitoringOptions{
++		URLs:           []string{n.server.URL + "/generate_204"},
++		URLTestTimeout: badoption.Duration(1500 * time.Millisecond),
++		DebounceWindow: badoption.Duration(10 * time.Millisecond),
++	}, good, refused, hole, flaky, grp)
++	// let the start-up cycle finish, then the user's 测速
++	require.Eventually(t, func() bool { return m.OutboundsHistory("grp")["hole"].Delay == TimeoutDelay }, 8*time.Second, 20*time.Millisecond)
++	for _, tag := range []string{"good", "refused", "hole", "flaky"} {
++		n.dials.Store(tag, new(atomic.Int32))
++	}
++	start := time.Now()
++	require.NoError(t, m.TestNow("grp"))
++	require.Eventually(t, func() bool { return n.count("refused") == 1 && n.count("good") == 1 }, 3*time.Second, 5*time.Millisecond)
++	require.Eventually(t, func() bool { return m.OutboundsHistory("grp")["hole"].Delay == 0 }, 3*time.Second, 5*time.Millisecond,
++		"hole: 0 (still testing) after the first tier")
++	require.Equal(t, TimeoutDelay, m.OutboundsHistory("grp")["refused"].Delay)
++	require.Eventually(t, func() bool { return m.OutboundsHistory("grp")["hole"].Delay == TimeoutDelay }, 6*time.Second, 10*time.Millisecond)
++	elapsed := time.Since(start)
++	require.Equal(t, int32(1+museRetestParallel), n.count("hole"), "first try + three connections in the re-test")
++	require.Equal(t, int32(1), n.count("refused"), "refused: no re-test")
++	require.Equal(t, int32(1), n.count("good"), "one connection per test")
++	require.Less(t, elapsed, 1500*time.Millisecond+museRetestBackoff+1500*time.Millisecond+time.Second)
++	h := m.OutboundsHistory("grp")["flaky"]
++	require.Greater(t, h.Delay, uint16(0))
++	require.Less(t, h.Delay, TimeoutDelay, "a lost first connection is not 超时")
++}
++
++// Nodes with the same configuration are tested once and share the result; a fresh result is
++// reused by automatic tests but not by 测速.
++func TestMuseSameAsAndFresh(t *testing.T) {
++	n := newMuseTestNodes(t)
++	a, b, c := n.node("a", "good"), n.node("a copy", "good"), n.node("c", "good")
++	grp := &fakeGroup{fakeOutbound: fakeOutbound{tag: "grp"}, all: []string{"a", "a copy", "c"}}
++	m := museUnifiedMonitor(t, option.MonitoringOptions{
++		URLs:           []string{n.server.URL + "/generate_204"},
++		URLTestTimeout: badoption.Duration(2 * time.Second),
++		DebounceWindow: badoption.Duration(10 * time.Millisecond),
++		MuseSameAs:     map[string]string{"a copy": "a"},
++	}, a, b, c, grp)
++	require.Eventually(t, func() bool {
++		h := m.OutboundsHistory("grp")
++		return h["a copy"].Delay > 0 && h["a copy"].Delay < TimeoutDelay && h["c"].Delay > 0 && h["c"].Delay < TimeoutDelay
++	}, 4*time.Second, 10*time.Millisecond)
++	require.Equal(t, int32(0), n.count("a copy"), "the copy is never dialed")
++	require.Equal(t, m.OutboundsHistory("grp")["a"].Delay, m.OutboundsHistory("grp")["a copy"].Delay)
++
++	// automatic test within a minute: reused
++	before := n.count("c")
++	require.NoError(t, m.testNow("c", true))
++	time.Sleep(200 * time.Millisecond)
++	require.Equal(t, before, n.count("c"), "fresh result reused")
++	// 测速: always tests
++	require.NoError(t, m.TestNow("c"))
++	require.Eventually(t, func() bool { return n.count("c") > before }, 2*time.Second, 5*time.Millisecond)
++	// the copy asked for directly is tested as "a"
++	beforeA := n.count("a")
++	require.NoError(t, m.TestNow("a copy"))
++	require.Eventually(t, func() bool { return n.count("a") > beforeA }, 2*time.Second, 5*time.Millisecond)
++	require.Equal(t, int32(0), n.count("a copy"))
++	// after a hot reload nothing is shared any more
++	require.NoError(t, m.Reload())
++	require.Equal(t, "a copy", m.primaryOf("a copy"))
++}
++
++// 60 nodes: never more test connections at once than the budget, and the gate grows past 8.
++func TestMuseManyNodesStayWithinBudget(t *testing.T) {
++	n := newMuseTestNodes(t)
++	n.connect = 40 * time.Millisecond
++	var outs []adapter.Outbound
++	var tags []string
++	for i := 0; i < 60; i++ {
++		tag := fmt.Sprintf("n%02d", i)
++		tags = append(tags, tag)
++		outs = append(outs, n.node(tag, "good"))
++	}
++	outs = append(outs, &fakeGroup{fakeOutbound: fakeOutbound{tag: "grp"}, all: tags})
++	m := museUnifiedMonitor(t, option.MonitoringOptions{
++		URLs:           []string{n.server.URL + "/generate_204"},
++		URLTestTimeout: badoption.Duration(3 * time.Second),
++	}, outs...)
++	require.Eventually(t, func() bool {
++		for _, h := range m.OutboundsHistory("grp") {
++			if h.Delay == 0 || h.Delay >= TimeoutDelay {
++				return false
++			}
++		}
++		return true
++	}, 10*time.Second, 10*time.Millisecond)
++	require.LessOrEqual(t, int(n.peak.Load()), museConnBudget(defaultWorkerCount))
++	require.Greater(t, m.gate.currentLimit(), defaultWorkerCount, "no timeouts: more tests at once")
++	require.Greater(t, int(m.gate.peakUse), defaultWorkerCount)
++}
+diff --git a/common/monitoring/muse_latency.go b/common/monitoring/muse_latency.go
+index 0a708b3c0..2625bdcd7 100644
+--- a/common/monitoring/muse_latency.go
++++ b/common/monitoring/muse_latency.go
+@@ -12,6 +12,8 @@ package monitoring
+ // picks by, so both always agree.
+ 
+ import (
++	"context"
++	"errors"
+ 	"sort"
+ 	"sync"
+ 	"time"
+@@ -81,16 +83,44 @@ func (l *museLatency) addSamples(now time.Time, delays ...uint16) uint16 {
+ 	return uint16((uint32(ds[n/2-1]) + uint32(ds[n/2]) + 1) / 2)
+ }
+ 
+-// apply takes one test result and returns the delay to report and whether to re-test soon.
++// apply takes one test result and returns the delay to report and whether to re-test soon. A
++// failure is treated as a timeout; the second failure in a row of a node without a good value is
++// final (see applyKind).
+ func (l *museLatency) apply(thorough bool, ok bool, delay uint16) (report uint16, retest bool) {
++	kind := museResultSlow
++	if ok {
++		kind = museResultOK
++	}
++	good := l.value > 0 && l.value < TimeoutDelay
++	return l.applyKind(thorough, kind, delay, !good && l.fails > 0)
++}
++
++// preview is the value a thorough test would report with [sample] as its result, without
++// keeping it (穿云 1.10.4: the first round trip is shown at once).
++func (l *museLatency) preview(sample uint16) uint16 {
++	saved := l.samples
++	l.samples = append([]museSample(nil), saved...)
++	v := l.addSamples(time.Now(), sample)
++	l.samples = saved
++	return v
++}
++
++// applyKind takes one test result (穿云 1.10.4): [kind] says how it ended and [final] that it was
++// the re-test (full timeout) of a node that timed out on its first try. A fast failure (refused,
++// no such host) of a node without a good value is final at once; a timeout of its first try is
++// reported as 0 (still testing) and re-tested.
++func (l *museLatency) applyKind(thorough bool, kind museResultKind, delay uint16, final bool) (report uint16, retest bool) {
+ 	good := l.value > 0 && l.value < TimeoutDelay
++	ok := kind == museResultOK
+ 	switch {
+ 	case ok && thorough:
+ 		l.value, l.fails = l.addSamples(time.Now(), delay), 0
+ 	case ok:
+ 		l.value, l.fails = museSmooth(l.value, delay), 0
+ 		l.addSamples(time.Now(), delay)
+-	case !good && l.fails == 0 && (thorough || l.value == 0):
++	case !good && kind == museResultFast:
++		l.value, l.fails, l.samples = TimeoutDelay, 0, nil
++	case !good && !final && (thorough || l.value == 0):
+ 		// 穿云 1.10.3: a node without a good value (never measured, or timed out before) that
+ 		// fails a 测速 is tested once more before it counts as timed out: report 0 ("still
+ 		// testing", the app keeps showing 测速中) and re-test shortly, off the busy moment of the
+@@ -162,23 +192,123 @@ func museProbeMedian(probe func(time.Duration) (uint16, error), timeout time.Dur
+ 	return medianDelay(ok), nil
+ }
+ 
+-// museRetestDelay: how soon a failed node is tested again — a node that never had a good value
+-// sooner (the user is waiting for its first result) than a working one after a periodic miss.
+-func museRetestDelay(hadGoodValue bool) time.Duration {
+-	if hadGoodValue {
++// museRetestDelay: how soon a failed node is tested again — 穿云 1.10.4: a node the user is
++// waiting for (no good value yet, or a 测速) after a short backoff, ahead of the queue; a working
++// node after a periodic miss later.
++func museRetestDelay(hadGoodValue bool, thorough bool) time.Duration {
++	if hadGoodValue && !thorough {
+ 		return museRetestAfter
+ 	}
+-	return museRetestFirstFailAfter
++	return museRetestBackoff
+ }
+ 
+-// scheduleRetest tests a node again shortly after its first failure.
+-func (m *OutboundMonitoring) scheduleRetest(tag string, after time.Duration) {
++// scheduleRetest tests a node again shortly after its first failure, with the full timeout
++// (穿云 1.10.4: [soon] = ahead of the queue instead of behind the running 测速).
++func (m *OutboundMonitoring) scheduleRetest(tag string, after time.Duration, soon bool) {
+ 	go func() {
+ 		select {
+ 		case <-m.ctx.Done():
+ 			return
+ 		case <-time.After(after):
+ 		}
+-		m.enqueueTask(&testTask{outboundTag: tag, cycleID: m.cycleSeq + 1_000_000})
++		m.enqueueTask(&testTask{outboundTag: tag, cycleID: m.cycleSeq + 1_000_000, priority: soon, retest: true})
+ 	}()
+ }
++
++// museRace runs [try] [n] times and returns the first success. With [hedge] > 0 the tries start
++// one after another, each [hedge] after the previous one unless that one already got its first
++// answer (answered); with 0 they all start at once. The others are cancelled. When all fail the
++// error of one that did not fail fast is returned (so a mix still counts as a timeout).
++//
++// [tokens] caps the test connections open at once across the monitor: the first try waits for a
++// token, the extra ones only start when a token is free (nil = no cap).
++func museRace(parent context.Context, tokens chan struct{}, n int, hedge time.Duration, try func(ctx context.Context, answered func()) ([]uint16, error)) ([]uint16, error) {
++	ctx, cancel := context.WithCancel(parent)
++	defer cancel()
++	if tokens != nil {
++		select {
++		case tokens <- struct{}{}:
++		case <-parent.Done():
++			return nil, parent.Err()
++		}
++	}
++	type result struct {
++		samples []uint16
++		err     error
++	}
++	results := make(chan result, n)
++	answered := make(chan struct{})
++	var answerOnce sync.Once
++	mark := func() { answerOnce.Do(func() { close(answered) }) }
++	launch := func() {
++		go func() {
++			if tokens != nil {
++				defer func() { <-tokens }()
++			}
++			s, err := try(ctx, mark)
++			results <- result{s, err}
++		}()
++	}
++	// an extra try only with a free token
++	extra := func() bool {
++		if tokens != nil {
++			select {
++			case tokens <- struct{}{}:
++			default:
++				return false
++			}
++		}
++		launch()
++		return true
++	}
++	started := 1
++	launch()
++	if hedge <= 0 {
++		for started < n && extra() {
++			started++
++		}
++	}
++	var timer <-chan time.Time
++	if hedge > 0 && started < n {
++		timer = time.After(hedge)
++	}
++	var lastErr, slowErr error
++	for got := 0; got < started; {
++		select {
++		case r := <-results:
++			got++
++			if r.err == nil && len(r.samples) > 0 {
++				return r.samples, nil
++			}
++			lastErr = r.err
++			if r.err != nil && !museFastFailure(r.err) {
++				slowErr = r.err
++			}
++			if hedge > 0 && got == started && started < n && museFastFailure(r.err) {
++				// refused at once: another connection will not change that
++				return nil, r.err
++			}
++		case <-timer:
++			timer = nil
++			select {
++			case <-answered:
++			default:
++				if extra() {
++					started++
++				}
++				if started < n {
++					timer = time.After(hedge)
++				}
++			}
++		case <-parent.Done():
++			return nil, parent.Err()
++		}
++	}
++	if slowErr != nil {
++		return nil, slowErr
++	}
++	if lastErr == nil {
++		lastErr = errors.New("timeout")
++	}
++	return nil, lastErr
++}
+diff --git a/common/monitoring/muse_latency_test.go b/common/monitoring/muse_latency_test.go
+index c92dcf00e..df5aa171a 100644
+--- a/common/monitoring/muse_latency_test.go
++++ b/common/monitoring/muse_latency_test.go
+@@ -75,17 +75,22 @@ func TestMuseLatencyFirstFailureRetestsOnce(t *testing.T) {
+ }
+ 
+ func TestMuseRetestDelay(t *testing.T) {
+-	require.Equal(t, museRetestAfter, museRetestDelay(true))
+-	require.Equal(t, museRetestFirstFailAfter, museRetestDelay(false))
+-	require.Less(t, museRetestFirstFailAfter, museRetestAfter)
++	// 穿云 1.10.4: a node the user waits for is re-tested after a short backoff
++	require.Equal(t, museRetestAfter, museRetestDelay(true, false))
++	require.Equal(t, museRetestBackoff, museRetestDelay(false, true))
++	require.Equal(t, museRetestBackoff, museRetestDelay(false, false))
++	require.Equal(t, museRetestBackoff, museRetestDelay(true, true))
++	require.Less(t, museRetestBackoff, museRetestFirstFailAfter)
+ }
+ 
+-// 穿云 1.10.3: at most workers × (1 + samples) connections at once during 测速 (was 16 × 6).
++// 穿云 1.10.3 budget kept by 1.10.4: no more test connections at once than 8 workers × 3 probes.
+ func TestMuseTestConcurrencyBudget(t *testing.T) {
+ 	require.Equal(t, 8, defaultWorkerCount)
+ 	require.Equal(t, 8, MuseClampWorkers(0))
+ 	require.Equal(t, 3, museThoroughSamples)
+-	require.LessOrEqual(t, defaultWorkerCount*museThoroughSamples, 24)
++	require.Equal(t, defaultWorkerCount*museThoroughSamples, museConnBudget(defaultWorkerCount))
++	require.Equal(t, 24, museGateMax(defaultWorkerCount), "the gate grows to 24 single-connection tests")
++	require.LessOrEqual(t, museGateMax(defaultWorkerCount), museConnBudget(defaultWorkerCount))
+ 	require.Equal(t, 8*time.Second, defaultURLTestTimeout)
+ }
+ 
+diff --git a/common/monitoring/muse_speedtest_sim_test.go b/common/monitoring/muse_speedtest_sim_test.go
+new file mode 100644
+index 000000000..181cc36fd
+--- /dev/null
++++ b/common/monitoring/muse_speedtest_sim_test.go
+@@ -0,0 +1,383 @@
++package monitoring
++
++// 穿云 1.10.4: a simulation of one 测速 over 50 / 100 / 200 nodes on a congested home line, with
++// the 1.10.3 strategy and the 1.10.4 one (both modelled from their code, same random nodes and
++// line). It shows that the whole test is faster and that working nodes are not reported 超时
++// more often.
++//
++// Line model: every connection has a base time from the node's round trip (connect + TLS = 3 RTT
++// through the proxy, each HTTP request 1 RTT). Each packet exchange of a connection can be lost
++// with probability q, which grows once more connections are open at once than the line takes
++// (24, the 1.10.3 budget; China Mobile style session limit / QoS); a loss costs the TCP
++// retransmission (1 s, then 2 s, 4 s …). Node mix: working nodes (80–400 ms), slow ones
++// (0.9–1.8 s), nodes that never answer, refused ones, and working nodes on a lossy route.
++
++import (
++	"math"
++	"math/rand"
++	"sort"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++type simNodeKind int
++
++const (
++	simGood simNodeKind = iota
++	simSlow
++	simDead
++	simRefused
++	simLossy
++)
++
++type simNode struct {
++	kind simNodeKind
++	rtt  float64 // seconds
++}
++
++type simLine struct {
++	rng   *rand.Rand
++	limit int
++}
++
++// q: chance that one packet exchange is lost with [open] connections at once.
++func (l *simLine) q(open int, lossy bool) float64 {
++	q := 0.02
++	if lossy {
++		q = 0.15
++	}
++	if open > l.limit {
++		q += 0.6 * float64(open-l.limit) / float64(l.limit)
++	}
++	return math.Min(q, 0.9)
++}
++
++// penalty: retransmission time of [exchanges] packet exchanges (geometric losses each).
++func (l *simLine) penalty(exchanges int, q float64) float64 {
++	p := 0.0
++	for i := 0; i < exchanges; i++ {
++		rto := 1.0
++		for l.rng.Float64() < q && rto < 64 {
++			p += rto
++			rto *= 2
++		}
++	}
++	return p
++}
++
++// conn returns when the setup (connect + TLS + first request) and the following [req] requests
++// on the same connection finish (math.Inf = never) and the measured round trip of those requests.
++func (l *simLine) conn(n simNode, open int, req int) (setup, done float64, sample float64) {
++	switch n.kind {
++	case simDead:
++		return math.Inf(1), math.Inf(1), 0
++	case simRefused:
++		return -0.05, -0.05, 0 // negative = failed fast after |t|
++	}
++	q := l.q(open, n.kind == simLossy)
++	jitter := func() float64 { return n.rtt * (1 + 0.15*l.rng.NormFloat64()*0.5) }
++	setup = 3*n.rtt + jitter() + l.penalty(4, q)
++	done = setup
++	var samples []float64
++	for i := 0; i < req; i++ {
++		s := jitter() + l.penalty(1, q)
++		samples = append(samples, s)
++		done += s
++	}
++	if len(samples) > 0 {
++		sort.Float64s(samples)
++		sample = samples[len(samples)/2]
++	}
++	return setup, done, sample
++}
++
++type simJob struct {
++	node     int
++	retest   bool
++	ready    float64
++	priority bool
++}
++
++type simRun struct {
++	end   float64
++	conns int
++	node  int
++	ok    bool
++	fast  bool
++	value float64
++	job   simJob
++}
++
++type simResult struct {
++	total       float64 // until every node has its final result
++	falseTO     int     // working nodes (good / slow / lossy) reported as timed out
++	shownErrMs  float64 // mean |shown − true RTT| of working nodes, ms
++	peakConns   int
++	firstShownS float64 // mean time until a working node shows a number
++}
++
++// attempt of one strategy: duration, connections, success, fast failure, value.
++type simAttempt func(l *simLine, n simNode, open int, retest bool) (dur float64, conns int, ok, fast bool, value float64)
++
++// 1.10.3: warm-up connection (8 s) then 3 connections at once (short timeout), each doing two
++// requests; the median of the second requests. A failed node is tested again (same test) 3 s
++// later, behind the queue.
++func simOld(l *simLine, n simNode, open int, retest bool) (float64, int, bool, bool, float64) {
++	const full = 8.0
++	ws, wd, _ := l.conn(n, open+1, 1)
++	warmOK := ws >= 0 && wd <= full
++	var dur float64
++	sampleTimeout := 3.0
++	switch {
++	case ws < 0:
++		dur = -ws
++	case warmOK:
++		dur = wd
++		sampleTimeout = math.Min(math.Max(3, wd*4+1.5), full) // museProbeTimeout(warm)
++	default:
++		dur = full
++	}
++	var vals []float64
++	longest := 0.0
++	for i := 0; i < 3; i++ {
++		s, d, v := l.conn(n, open+3, 1)
++		if s < 0 {
++			longest = math.Max(longest, -s)
++			continue
++		}
++		if d <= sampleTimeout {
++			vals = append(vals, v)
++			longest = math.Max(longest, d)
++		} else {
++			longest = sampleTimeout
++		}
++	}
++	dur += longest
++	if len(vals) == 0 {
++		return dur, 3, false, false, 0
++	}
++	sort.Float64s(vals)
++	return dur, 3, true, false, vals[len(vals)/2]
++}
++
++// 1.10.4: one connection, 5 s setup (second connection after 2.5 s if no answer yet), three
++// round trips on it; refused = final; a timeout is re-tested 1 s later ahead of the queue with
++// three connections at once and the full 8 s.
++func simNew(l *simLine, n simNode, open int, retest bool) (float64, int, bool, bool, float64) {
++	const full, tier, hedge = 8.0, 5.0, 2.5
++	budget := museConnBudget(8)
++	if retest {
++		best := math.Inf(1)
++		var value float64
++		tries := min(museRetestParallel, max(1, budget-open)) // extra tries only within the budget
++		for i := 0; i < tries; i++ {
++			s, d, v := l.conn(n, open+tries, 1)
++			if s >= 0 && s <= full && d < best {
++				best, value = d, v
++			}
++		}
++		if math.IsInf(best, 1) {
++			return full, tries, false, false, 0
++		}
++		return best, tries, true, false, value
++	}
++	s, d, v := l.conn(n, open+1, museSamplesFast)
++	if s < 0 {
++		return -s, 1, false, true, 0
++	}
++	conns := 1
++	if s > hedge && open+2 <= budget {
++		conns = 2
++		s2, d2, v2 := l.conn(n, open+2, museSamplesFast)
++		if s2 >= 0 && hedge+s2 < s {
++			s, d, v = hedge+s2, hedge+d2, v2
++		}
++	}
++	if s > tier {
++		return tier, conns, false, false, 0
++	}
++	return d, conns, true, false, v
++}
++
++func simulate(seed int64, nodes []simNode, attempt simAttempt, adaptive bool) simResult {
++	l := &simLine{rng: rand.New(rand.NewSource(seed)), limit: 24}
++	var res simResult
++	var queue []simJob
++	for i := range nodes {
++		queue = append(queue, simJob{node: i, priority: true})
++	}
++	gate := newMuseGate(8)
++	limit := func() int {
++		if adaptive {
++			return gate.limit
++		}
++		return 8
++	}
++	var running []simRun
++	now := 0.0
++	final := 0
++	shownAt := make([]float64, len(nodes))
++	var errSum float64
++	var errN int
++	retestDelay, retestPriority := 3.0, false
++	if adaptive {
++		retestDelay, retestPriority = museRetestBackoff.Seconds(), true
++	}
++	for final < len(nodes) {
++		// start what can start
++		for len(running) < limit() {
++			pick := -1
++			for i, j := range queue { // priority first, FIFO
++				if j.ready <= now && j.priority {
++					pick = i
++					break
++				}
++			}
++			if pick < 0 {
++				for i, j := range queue {
++					if j.ready <= now {
++						pick = i
++						break
++					}
++				}
++			}
++			if pick < 0 {
++				break
++			}
++			j := queue[pick]
++			queue = append(queue[:pick], queue[pick+1:]...)
++			open := 0
++			for _, r := range running {
++				open += r.conns
++			}
++			if adaptive && open >= museConnBudget(8) {
++				queue = append(queue[:pick], append([]simJob{j}, queue[pick:]...)...) // waits for a token
++				break
++			}
++			dur, conns, ok, fast, value := attempt(l, nodes[j.node], open, j.retest)
++			running = append(running, simRun{end: now + dur, conns: conns, node: j.node, ok: ok, fast: fast, value: value, job: j})
++			if open+conns > res.peakConns {
++				res.peakConns = open + conns
++			}
++		}
++		// next event
++		next := math.Inf(1)
++		for _, r := range running {
++			next = math.Min(next, r.end)
++		}
++		for _, j := range queue {
++			if j.ready > now {
++				next = math.Min(next, j.ready)
++			}
++		}
++		now = next
++		kept := running[:0]
++		for _, r := range running {
++			if r.end > now {
++				kept = append(kept, r)
++				continue
++			}
++			kind := museResultOK
++			switch {
++			case r.fast:
++				kind = museResultFast
++			case !r.ok:
++				kind = museResultSlow
++			}
++			if adaptive {
++				gate.observe(kind)
++			}
++			n := nodes[r.node]
++			working := n.kind == simGood || n.kind == simSlow || n.kind == simLossy
++			switch {
++			case r.ok:
++				final++
++				if working {
++					shownAt[r.node] = now
++				}
++				if n.kind == simGood { // accuracy on the nodes both strategies measure
++					errSum += math.Abs(r.value-n.rtt) * 1000
++					errN++
++				}
++			case r.job.retest || (adaptive && r.fast):
++				final++
++				if working {
++					res.falseTO++
++				}
++			default:
++				queue = append(queue, simJob{node: r.node, retest: true, ready: now + retestDelay, priority: retestPriority})
++			}
++		}
++		running = kept
++	}
++	res.total = now
++	if errN > 0 {
++		res.shownErrMs = errSum / float64(errN)
++	}
++	sum, cnt := 0.0, 0
++	for _, t := range shownAt {
++		if t > 0 {
++			sum += t
++			cnt++
++		}
++	}
++	if cnt > 0 {
++		res.firstShownS = sum / float64(cnt)
++	}
++	return res
++}
++
++func simNodes(seed int64, count int) []simNode {
++	rng := rand.New(rand.NewSource(seed * 7919))
++	nodes := make([]simNode, count)
++	for i := range nodes {
++		p := rng.Float64()
++		switch {
++		case p < 0.60:
++			nodes[i] = simNode{simGood, 0.08 + rng.Float64()*0.32}
++		case p < 0.70:
++			nodes[i] = simNode{simSlow, 0.9 + rng.Float64()*0.9}
++		case p < 0.82:
++			nodes[i] = simNode{simDead, 0}
++		case p < 0.92:
++			nodes[i] = simNode{simRefused, 0}
++		default:
++			nodes[i] = simNode{simLossy, 0.1 + rng.Float64()*0.3}
++		}
++	}
++	return nodes
++}
++
++func TestMuseSpeedTestSimulation(t *testing.T) {
++	const seeds = 40
++	for _, count := range []int{50, 100, 200} {
++		var old, cur simResult
++		for seed := int64(1); seed <= seeds; seed++ {
++			nodes := simNodes(seed, count)
++			o := simulate(seed, nodes, simOld, false)
++			c := simulate(seed, nodes, simNew, true)
++			old.total += o.total / seeds
++			cur.total += c.total / seeds
++			old.falseTO += o.falseTO
++			cur.falseTO += c.falseTO
++			old.shownErrMs += o.shownErrMs / seeds
++			cur.shownErrMs += c.shownErrMs / seeds
++			old.firstShownS += o.firstShownS / seeds
++			cur.firstShownS += c.firstShownS / seeds
++			old.peakConns = max(old.peakConns, o.peakConns)
++			cur.peakConns = max(cur.peakConns, c.peakConns)
++		}
++		t.Logf("N=%d  total 1.10.3 %.1f s → 1.10.4 %.1f s (−%.0f%%) | working node shown after %.1f s → %.1f s | false 超时 (in %d runs) %d → %d | shown error %.0f → %.0f ms | peak connections %d → %d",
++			count, old.total, cur.total, 100*(1-cur.total/old.total), old.firstShownS, cur.firstShownS,
++			seeds, old.falseTO, cur.falseTO, old.shownErrMs, cur.shownErrMs, old.peakConns, cur.peakConns)
++		require.Less(t, cur.total, old.total*0.7, "N=%d: at least 30%% faster", count)
++		require.LessOrEqual(t, cur.falseTO, old.falseTO, "N=%d: no more false 超时", count)
++		require.Less(t, cur.firstShownS, old.firstShownS, "N=%d: numbers show sooner", count)
++		require.LessOrEqual(t, cur.shownErrMs, old.shownErrMs*1.15, "N=%d: values as close to the real round trip", count)
++		require.LessOrEqual(t, cur.peakConns, 24, "N=%d: never more connections at once than 1.10.3", count)
++	}
++}
++
++var _ = time.Second
+diff --git a/common/monitoring/outbound_monitoring.go b/common/monitoring/outbound_monitoring.go
+index 1e06afecd..8a596a2a9 100644
+--- a/common/monitoring/outbound_monitoring.go
++++ b/common/monitoring/outbound_monitoring.go
+@@ -100,6 +100,11 @@ type OutboundMonitoring struct {
+ 	cycleSeq     uint64
+ 	cycleRunning atomic.Bool
+ 
++	// muse (穿云 1.10.4): adaptive test concurrency and nodes sharing one test (muse_fast.go)
++	gate       *museGate
++	connTokens chan struct{} // test connections open at once (museConnBudget)
++	museSame   atomic.Pointer[museSameAs]
++
+ 	workerWG    sync.WaitGroup
+ 	schedulerWG sync.WaitGroup
+ 	closerOnce  sync.Once
+@@ -107,6 +112,7 @@ type OutboundMonitoring struct {
+ 
+ // InterfaceUpdated implements [adapter.InterfaceUpdateListener].
+ func (m *OutboundMonitoring) InterfaceUpdated(ctx context.Context) {
++	m.gate.reset() // muse (穿云 1.10.4): a new network starts again from the configured count
+ 	m.startCycleOnce()
+ }
+ 
+@@ -273,8 +279,12 @@ func NewOutboundMonitoring(ctx context.Context, logger log.ContextLogger, option
+ 
+ 		priorityQueue: make(chan *testTask, 1000),
+ 		normalQueue:   make(chan *testTask, 10000),
++
++		gate:       newMuseGate(options.Workers),
++		connTokens: make(chan struct{}, museConnBudget(options.Workers)),
+ 	}
+ 	m.registry.Store(newMonitoringRegistry())
++	m.museSame.Store(newMuseSameAs(options.MuseSameAs))
+ 
+ 	return m, nil
+ }
+@@ -293,7 +303,8 @@ func (m *OutboundMonitoring) Start(stage adapter.StartStage) error {
+ 		m.logger.Info("registered ", len(registry.groups), " outbound groups for monitoring")
+ 		m.loadHistory()
+ 	case adapter.StartStatePostStart:
+-		for i := 0; i < m.workersCount; i++ {
++		// muse (穿云 1.10.4): the gate decides how many run at once (workersCount to 3×)
++		for i := 0; i < m.gate.max; i++ {
+ 			m.workerWG.Add(1)
+ 			go m.workerLoop()
+ 		}
+@@ -387,12 +398,15 @@ func (m *OutboundMonitoring) testNowThorough(outboundTag string, priority bool,
+ 		if state == nil {
+ 			return errors.New("outbound not registered")
+ 		}
++		// muse (穿云 1.10.4): a node with the same configuration as another is tested as that one
++		outboundTag = m.primaryOf(outboundTag)
+ 
+ 		task := &testTask{
+ 			outboundTag: outboundTag,
+ 			cycleID:     m.cycleSeq,
+ 			priority:    priority,
+ 			thorough:    thorough,
++			manual:      thorough, // only TestNow (测速) asks for a thorough test
+ 		}
+ 
+ 		if !m.enqueueTask(task) {
+@@ -498,26 +512,32 @@ func (m *OutboundMonitoring) workerLoop() {
+ 
+ 	defer m.workerWG.Done()
+ 	for {
+-
++		// muse (穿云 1.10.4): a slot of the adaptive gate first, then a task
++		if !m.gate.acquire(m.ctx) {
++			return
++		}
++		var task *testTask
+ 		select {
+ 		case <-m.ctx.Done():
++			m.gate.release(false, museResultOK)
+ 			return
+-		case task := <-m.priorityQueue:
+-			m.executeTask(task) //for prioritising tasks, we execute them immediately
++		case task = <-m.priorityQueue: //for prioritising tasks, we execute them immediately
+ 		default:
+ 			select {
+ 			case <-m.ctx.Done():
++				m.gate.release(false, museResultOK)
+ 				return
+-			case task := <-m.priorityQueue:
+-				m.executeTask(task)
+-			case task := <-m.normalQueue:
+-				m.executeTask(task)
++			case task = <-m.priorityQueue:
++			case task = <-m.normalQueue:
+ 			}
+ 		}
++		counted, kind := m.executeTask(task)
++		m.gate.release(counted, kind)
+ 	}
+ }
+ 
+-func (m *OutboundMonitoring) executeTask(task *testTask) {
++// executeTask runs one test; it reports whether a test ran and how it ended (for the gate).
++func (m *OutboundMonitoring) executeTask(task *testTask) (counted bool, kind museResultKind) {
+ 	select {
+ 	case <-m.ctx.Done():
+ 		return
+@@ -528,6 +548,28 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
+ 	if state == nil {
+ 		return
+ 	}
++	// muse (穿云 1.10.4): an automatic test reuses a result younger than a minute (a 测速 the user
++	// asked for, a re-test and an invalidated node always test)
++	if !task.manual && !task.retest {
++		state.mu.Lock()
++		fresh := museFresh(state, time.Now())
++		var outcome testOutcome
++		if fresh {
++			state.queued, state.priorityQueued, state.enqueuedCycle = false, false, 0
++			outcome = testOutcome{outboundTag: task.outboundTag, history: state.history, cycleID: task.cycleID, priority: task.priority}
++		}
++		state.mu.Unlock()
++		if fresh {
++			if task.resultCh != nil {
++				select {
++				case task.resultCh <- outcome:
++				case <-m.ctx.Done():
++				default:
++				}
++			}
++			return
++		}
++	}
+ 
+ 	state.mu.Lock()
+ 	state.testing = true
+@@ -554,7 +596,7 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
+ 			state.mu.Unlock()
+ 			m.enqueueTask(task)
+ 		}()
+-		return
++		return false, museResultOK
+ 	}
+ 	// muse: a node without a live value (new session, loaded from the cache, timed out) also
+ 	// gets the thorough test, so the first number shown is already a stable median
+@@ -564,7 +606,8 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
+ 	done := make(chan struct{})
+ 	go func() {
+ 		defer close(done)
+-		delay, err := m.tester(m.ctx, task.outboundTag, thorough)
++		delay, err, k := m.museTester(m.ctx, task.outboundTag, thorough, task.retest)
++		kind = k
+ 
+ 		outcome := testOutcome{
+ 			outboundTag: task.outboundTag,
+@@ -573,6 +616,8 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
+ 			cycleID:     task.cycleID,
+ 			priority:    task.priority,
+ 			thorough:    thorough,
++			kind:        k,
++			final:       task.retest,
+ 		}
+ 
+ 		m.applyResult(outcome)
+@@ -587,68 +632,90 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
+ 	}()
+ 	select {
+ 	case <-m.ctx.Done():
+-		return
++		return false, museResultOK
+ 	case <-done:
+ 	}
+-
++	return true, kind
+ }
+ 
++// tester runs the first test of a node (see museTester).
+ func (m *OutboundMonitoring) tester(parent context.Context, tag string, thorough bool) (adapter.URLTestHistory, error) {
++	h, err, _ := m.museTester(parent, tag, thorough, false)
++	return h, err
++}
++
++// museTester (穿云 1.10.4) tests [tag] on one kept-alive connection (urltest.MuseURLTestSamples):
++//   - a thorough test (测速, the first test of a session, the screen back on) takes three round
++//     trips after the setup; the first is shown at once, the median of all is the result. Its
++//     setup gets the first-tier timeout (5 s); after museHedgeAfter without an answer a second
++//     connection is tried alongside (a lost SYN on a lossy line), the first to answer counts;
++//   - a periodic test takes one round trip with the full timeout;
++//   - the re-test of a node that timed out ([final]) tries museRetestParallel connections at once
++//     with the full timeout; the node is 超时 only when none answers.
++//
++// It returns how the test ended: museResultFast (refused, no such host) is final at once.
++func (m *OutboundMonitoring) museTester(parent context.Context, tag string, thorough bool, final bool) (adapter.URLTestHistory, error, museResultKind) {
+ 	out, ok := m.reg().outbounds[tag]
+ 	if !ok {
+-		return adapter.URLTestHistory{Delay: 0}, errors.New("outbound not registered")
++		return adapter.URLTestHistory{Delay: 0}, errors.New("outbound not registered"), museResultFast
+ 	}
+ 
+ 	idx := m.currentLinkIndex.Load()
+ 	link := m.urls[idx]
+-	probe := func(timeout time.Duration) (uint16, error) {
+-		ctx, cancel := context.WithTimeout(parent, timeout)
+-		defer cancel()
+-		d, e := urltest.URLTest(ctx, link, out.outbound)
+-		if e == nil && d >= TimeoutDelay {
+-			e = errors.New("timeout")
++	full := m.urlTestTimeout
++	run := func(ctx context.Context, setup time.Duration, samples int, onSetup func(uint16), onFirst func(uint16)) ([]uint16, error) {
++		opt := urltest.MuseSampleOptions{SetupTimeout: setup, Samples: samples, OnSetup: onSetup, OnFirst: onFirst}
++		// a round trip on the open connection: a lost one is given up on well before the full
++		// timeout (the other samples still count)
++		opt.SampleTimeout = museSampleTimeout(full)
++		r, err := urltest.MuseURLTestSamples(ctx, link, out.outbound, opt)
++		if err != nil {
++			return nil, err
+ 		}
+-		return d, e
+-	}
+-	// muse (穿云 1.2.1): a thorough test (测速, first test of a session, screen back on) is one
+-	// warm-up probe that is thrown away (DNS, cold handshake), then three probes run at the same
+-	// time; the median of those that answered is the node's delay. The probes share the node, so
+-	// the test takes about two round trips, not four. A periodic test is a single probe that is
+-	// smoothed with the previous value (see museLatency.apply).
+-	var delay uint16
++		return r.Samples, nil
++	}
++
++	var samples []uint16
+ 	var err error
+-	if thorough {
+-		// 穿云 1.2.5: a lost warm-up no longer fails the whole test (it was the "超时" on the
+-		// first tap); the samples then get the full timeout, and the node counts as timed out
+-		// only when every probe failed.
+-		var warm uint16
+-		var werr error
+-		warm, werr = probe(m.urlTestTimeout)
+-		timeout := m.urlTestTimeout
+-		if werr == nil {
+-			timeout = museProbeTimeout(warm, m.urlTestTimeout)
+-		} else {
+-			// muse (穿云 1.4.0): the warm-up already waited the full timeout; the samples get the
+-			// short one, so a dead node blocks a worker ~timeout+3 s instead of twice the timeout
+-			timeout = museLostWarmupTimeout(m.urlTestTimeout)
++	switch {
++	case final:
++		samples, err = museRace(parent, m.connTokens, museRetestParallel, 0, func(ctx context.Context, _ func()) ([]uint16, error) {
++			return run(ctx, full, 1, nil, nil)
++		})
++	case thorough:
++		setup := museFirstTierTimeout(full)
++		var once sync.Once
++		onFirst := func(d uint16) { once.Do(func() { m.applyInterim(tag, d) }) }
++		// a second connection only when the setup may still answer after museHedgeAfter
++		tries, hedge := 2, museHedgeAfter
++		if setup <= hedge {
++			tries, hedge = 1, 0
+ 		}
+-		delay, err = museProbeMedian(probe, timeout, museThoroughSamples)
+-	} else {
+-		delay, err = probe(m.urlTestTimeout)
++		samples, err = museRace(parent, m.connTokens, tries, hedge, func(ctx context.Context, answered func()) ([]uint16, error) {
++			return run(ctx, setup, museSamplesFast, func(uint16) { answered() }, onFirst)
++		})
++	default:
++		samples, err = museRace(parent, m.connTokens, 1, 0, func(ctx context.Context, _ func()) ([]uint16, error) {
++			return run(ctx, full, 1, nil, nil)
++		})
+ 	}
+ 
+-	his := adapter.URLTestHistory{
+-		Time:  time.Now(),
+-		Delay: delay,
++	his := adapter.URLTestHistory{Time: time.Now()}
++	if err == nil && len(samples) > 0 {
++		his.Delay = medianDelay(samples)
+ 	}
+-	if err != nil || delay >= TimeoutDelay {
++	if err != nil || his.Delay == 0 || his.Delay >= TimeoutDelay {
++		if err == nil {
++			err = errors.New("timeout")
++		}
+ 		his.Delay = TimeoutDelay
++		kind := museKindOf(err, 0)
+ 		m.logger.Warn("outbound ", tag, " URL test failed: ", err)
+-		return his, err
++		return his, err, kind
+ 	}
+ 	select {
+ 	case <-parent.Done():
+-		return his, parent.Err()
++		return his, parent.Err(), museResultSlow
+ 	default:
+ 	}
+ 	if out.history.IpInfo == nil || out.from_cache {
+@@ -657,7 +724,7 @@ func (m *OutboundMonitoring) tester(parent context.Context, tag string, thorough
+ 		m.lookupIpInfoLater(tag)
+ 	}
+ 	m.logger.Info("outbound ", tag, " (", his.Delay, "ms)")
+-	return his, nil
++	return his, nil, museResultOK
+ }
+ 
+ func (m *OutboundMonitoring) startCycleOnce() bool {
+@@ -787,6 +854,17 @@ func (m *OutboundMonitoring) enqueueTask(task *testTask) bool {
+ }
+ 
+ func (m *OutboundMonitoring) applyResult(outcome testOutcome) *adapter.URLTestHistory {
++	h := m.applyResultOne(outcome, true)
++	// muse (穿云 1.10.4): nodes with the same configuration share the result
++	for _, dup := range m.sameAs().mirrors[outcome.outboundTag] {
++		mirrored := outcome
++		mirrored.outboundTag = dup
++		m.applyResultOne(mirrored, false)
++	}
++	return h
++}
++
++func (m *OutboundMonitoring) applyResultOne(outcome testOutcome, scheduleRetests bool) *adapter.URLTestHistory {
+ 	select {
+ 	case <-m.ctx.Done():
+ 		return nil
+@@ -812,10 +890,20 @@ func (m *OutboundMonitoring) applyResult(outcome testOutcome) *adapter.URLTestHi
+ 	// value (and re-tests soon) instead of reporting the node dead at once.
+ 	okSample := outcome.err == nil && outcome.history.Delay > 0 && outcome.history.Delay < TimeoutDelay
+ 	hadGood := state.latency.value > 0 && state.latency.value < TimeoutDelay
+-	reported, retest := state.latency.apply(outcome.thorough, okSample, outcome.history.Delay)
++	// muse (穿云 1.10.4): how the test ended decides — a fast failure is final, a timeout of a
++	// first try is re-tested (outcome.final = this was that re-test)
++	kind := outcome.kind
++	if !okSample && kind == museResultOK {
++		kind = museResultSlow
++	}
++	if okSample {
++		kind = museResultOK
++	}
++	final := outcome.final || (!hadGood && state.latency.fails > 0)
++	reported, retest := state.latency.applyKind(outcome.thorough, kind, outcome.history.Delay, final)
+ 	outcome.history.Delay = reported
+-	if retest {
+-		m.scheduleRetest(outcome.outboundTag, museRetestDelay(hadGood))
++	if retest && scheduleRetests {
++		m.scheduleRetest(outcome.outboundTag, museRetestDelay(hadGood, outcome.thorough), !hadGood)
+ 	}
+ 	if okSample || reported >= TimeoutDelay {
+ 		state.invalid = !okSample
+@@ -859,10 +947,15 @@ func (m *OutboundMonitoring) collectCycleTargets() []string {
+ 	// muse: right after the screen comes back on every node is tested again
+ 	force := m.forceAll.Swap(false)
+ 
++	same := m.sameAs()
+ 	for tag, state := range m.reg().outbounds {
+ 		if _, ok := m.reg().groups[tag]; ok {
+ 			continue
+ 		}
++		// muse (穿云 1.10.4): a node with the same configuration as another gets that one's result
++		if p, dup := same.primary[tag]; dup && m.getState(p) != nil {
++			continue
++		}
+ 		state.mu.Lock()
+ 		if state.testing || state.queued || state.priorityQueued {
+ 			state.mu.Unlock()
+@@ -1007,6 +1100,8 @@ type testTask struct {
+ 	priority    bool
+ 	thorough    bool // muse: warm-up + 3 probes, median
+ 	resultCh    chan<- testOutcome
++	manual      bool // muse (穿云 1.10.4): 测速 the user asked for — never reuses a fresh result
++	retest      bool // muse (穿云 1.10.4): the full-timeout re-test of a node that timed out
+ }
+ 
+ type testOutcome struct {
+@@ -1017,6 +1112,8 @@ type testOutcome struct {
+ 	cycleID     uint64
+ 	priority    bool
+ 	thorough    bool
++	kind        museResultKind // muse (穿云 1.10.4)
++	final       bool
+ }
+ 
+ type outboundState struct {
+diff --git a/common/urltest/muse_samples.go b/common/urltest/muse_samples.go
+new file mode 100644
+index 000000000..babd9de3d
+--- /dev/null
++++ b/common/urltest/muse_samples.go
+@@ -0,0 +1,181 @@
++package urltest
++
++// muse (穿云 1.10.4): faster and steadier 测速 with one connection per node.
++//
++// The thorough test used to open a warm-up connection and then three more at once, each doing a
++// full connect + TLS + two HEAD requests, and kept the median of the second requests. Now one
++// connection is opened (connect, TLS, the first HEAD — the "setup") and the following HEAD
++// requests are sent on that same kept-alive connection; each of their round trips is a sample.
++// A reused connection has no handshake in it, so the samples are the node's real round trip
++// (the same thing the unified delay measured before), with a quarter of the connections and
++// about half the time. When the server does not keep the connection alive, one new connection is
++// opened for the samples; when no sample can be taken at all the setup time is used (a node that
++// answered is never reported as timed out because a second request failed).
++
++import (
++	"context"
++	"crypto/tls"
++	"errors"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptrace"
++	"net/url"
++	"sync/atomic"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/common/ntp"
++)
++
++// MuseSampleOptions describes one sampled test.
++type MuseSampleOptions struct {
++	// SetupTimeout bounds connect + handshakes + the first request.
++	SetupTimeout time.Duration
++	// SampleTimeout bounds each following request.
++	SampleTimeout time.Duration
++	// Samples is how many round trips to take on the kept-alive connection (at least 1).
++	Samples int
++	// OnSetup is called once the first request answered.
++	OnSetup func(setup uint16)
++	// OnFirst is called with the first sample when more are going to follow (shown at once,
++	// refined by the rest).
++	OnFirst func(sample uint16)
++}
++
++// MuseSamples is the outcome of a sampled test.
++type MuseSamples struct {
++	Setup   uint16   // ms from dialing to the first answer
++	Samples []uint16 // round trips on the reused connection (or [Setup], see above)
++	Reused  int      // how many of Samples were taken on a reused connection
++}
++
++const museMaxDials = 2
++
++var errMuseNoMoreDials = errors.New("urltest: connection not kept alive")
++
++// MuseURLTestSamples runs a sampled test of [link] through [detour].
++func MuseURLTestSamples(parent context.Context, link string, detour N.Dialer, opt MuseSampleOptions) (MuseSamples, error) {
++	var out MuseSamples
++	if detour == nil {
++		return out, errors.New("urltest dialer is nil")
++	}
++	if link == "" {
++		link = "https://www.gstatic.com/generate_204"
++	}
++	linkURL, err := url.Parse(link)
++	if err != nil {
++		return out, err
++	}
++	hostname, port := linkURL.Hostname(), linkURL.Port()
++	if port == "" {
++		switch linkURL.Scheme {
++		case "http":
++			port = "80"
++		case "https":
++			port = "443"
++		}
++	}
++	if opt.Samples < 1 {
++		opt.Samples = 1
++	}
++	var dials atomic.Int32
++	// the connection lives as long as this test, not as long as the request that opened it (some
++	// outbounds tie a stream to the dial context); the request contexts bound each step
++	connCtx, cancelConn := context.WithCancel(parent)
++	defer cancelConn()
++	transport := &http.Transport{
++		DialContext: func(_ context.Context, network, addr string) (net.Conn, error) {
++			if dials.Add(1) > museMaxDials {
++				return nil, errMuseNoMoreDials
++			}
++			return detour.DialContext(connCtx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
++		},
++		TLSClientConfig: &tls.Config{
++			Time:    ntp.TimeFuncFromContext(parent),
++			RootCAs: adapter.RootPoolFromContext(parent),
++		},
++		MaxIdleConns:        1,
++		MaxIdleConnsPerHost: 1,
++		IdleConnTimeout:     30 * time.Second,
++		ForceAttemptHTTP2:   false,
++	}
++	client := http.Client{
++		Transport: transport,
++		CheckRedirect: func(req *http.Request, via []*http.Request) error {
++			return http.ErrUseLastResponse
++		},
++	}
++	defer client.CloseIdleConnections()
++
++	do := func(timeout time.Duration) (ms uint16, reused bool, err error) {
++		ctx, cancel := context.WithTimeout(parent, timeout)
++		defer cancel()
++		trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused }}
++		req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodHead, link, nil)
++		if err != nil {
++			return 0, false, err
++		}
++		start := time.Now()
++		resp, err := client.Do(req)
++		if err != nil {
++			if ctx.Err() != nil && parent.Err() == nil {
++				return 0, reused, context.DeadlineExceeded
++			}
++			return 0, reused, err
++		}
++		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
++		resp.Body.Close()
++		d := time.Since(start) / time.Millisecond
++		if d < 1 {
++			d = 1
++		}
++		if d >= time.Duration(65535) {
++			d = 65534
++		}
++		return uint16(d), reused, nil
++	}
++
++	setup, _, err := do(opt.SetupTimeout)
++	if err != nil {
++		return out, err
++	}
++	out.Setup = setup
++	if opt.OnSetup != nil {
++		opt.OnSetup(setup)
++	}
++	if !IsUnifiedDelayFromContext(parent) {
++		// the plain delay is the whole first request, as urlTest reports it
++		out.Samples = []uint16{setup}
++		return out, nil
++	}
++	sampleTimeout := opt.SampleTimeout
++	if sampleTimeout <= 0 {
++		sampleTimeout = opt.SetupTimeout
++	}
++	// one extra try: a request that had to open a new connection is setup, not a sample
++	for tries := 0; len(out.Samples) < opt.Samples && tries < opt.Samples+1; tries++ {
++		if parent.Err() != nil {
++			break
++		}
++		d, reused, err := do(sampleTimeout)
++		if err != nil {
++			break
++		}
++		if !reused {
++			continue
++		}
++		out.Samples = append(out.Samples, d)
++		out.Reused++
++		if len(out.Samples) == 1 && opt.Samples > 1 && opt.OnFirst != nil {
++			opt.OnFirst(d)
++		}
++	}
++	if len(out.Samples) == 0 {
++		// the node answered; without a reused round trip its setup time is the best we have
++		out.Samples = []uint16{setup}
++	}
++	return out, nil
++}
+diff --git a/common/urltest/muse_samples_test.go b/common/urltest/muse_samples_test.go
+new file mode 100644
+index 000000000..8c1133951
+--- /dev/null
++++ b/common/urltest/muse_samples_test.go
+@@ -0,0 +1,117 @@
++package urltest
++
++import (
++	"context"
++	"errors"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	M "github.com/sagernet/sing/common/metadata"
++
++	"github.com/stretchr/testify/require"
++)
++
++// slowConn adds [rtt] to every request it carries (one round trip per write).
++type slowConn struct {
++	net.Conn
++	rtt time.Duration
++}
++
++func (c *slowConn) Write(b []byte) (int, error) { time.Sleep(c.rtt); return c.Conn.Write(b) }
++
++type rttDialer struct {
++	addr      string
++	handshake time.Duration
++	rtt       time.Duration
++	dials     atomic.Int32
++	fail      error
++}
++
++func (d *rttDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	d.dials.Add(1)
++	if d.fail != nil {
++		return nil, d.fail
++	}
++	select {
++	case <-time.After(d.handshake):
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	}
++	var dialer net.Dialer
++	conn, err := dialer.DialContext(ctx, network, d.addr)
++	if err != nil {
++		return nil, err
++	}
++	return &slowConn{Conn: conn, rtt: d.rtt}, nil
++}
++
++func (d *rttDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	return nil, net.ErrClosed
++}
++
++// 穿云 1.10.4: one connection, HEAD requests kept alive; the samples are the round trips on the
++// reused connection (no handshake in them), the first is reported early.
++func TestMuseURLTestSamplesReuseOneConnection(t *testing.T) {
++	server, hits := countingServer(t) // asserts HEAD
++	d := &rttDialer{addr: server.Listener.Addr().String(), handshake: 150 * time.Millisecond, rtt: 40 * time.Millisecond}
++	ctx := ContextWithIsUnifiedDelay(context.Background())
++	var first, setupSeen atomic.Int32
++	r, err := MuseURLTestSamples(ctx, server.URL+"/generate_204", d, MuseSampleOptions{
++		SetupTimeout: 2 * time.Second, SampleTimeout: time.Second, Samples: 3,
++		OnSetup: func(uint16) { setupSeen.Add(1) },
++		OnFirst: func(s uint16) { first.Store(int32(s)) },
++	})
++	require.NoError(t, err)
++	require.Equal(t, int32(1), d.dials.Load(), "one connection per test")
++	require.Equal(t, int32(4), hits.Load(), "setup + 3 samples")
++	require.Len(t, r.Samples, 3)
++	require.Equal(t, 3, r.Reused)
++	require.Equal(t, int32(1), setupSeen.Load())
++	require.NotZero(t, first.Load())
++	require.GreaterOrEqual(t, r.Setup, uint16(190), "setup includes the handshake")
++	for _, s := range r.Samples {
++		require.GreaterOrEqual(t, s, uint16(40))
++		require.Less(t, s, uint16(140), "a sample is a round trip, not a handshake")
++	}
++}
++
++func TestMuseURLTestSamplesPlainDelayIsSetup(t *testing.T) {
++	server, hits := countingServer(t)
++	d := &rttDialer{addr: server.Listener.Addr().String(), handshake: 50 * time.Millisecond}
++	r, err := MuseURLTestSamples(context.Background(), server.URL, d, MuseSampleOptions{SetupTimeout: time.Second, Samples: 3})
++	require.NoError(t, err)
++	require.Equal(t, []uint16{r.Setup}, r.Samples)
++	require.Equal(t, int32(1), hits.Load())
++}
++
++// A server that closes every connection: the node still answered, so it is never a failure.
++func TestMuseURLTestSamplesNoKeepAlive(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Connection", "close")
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	defer server.Close()
++	d := &rttDialer{addr: server.Listener.Addr().String()}
++	r, err := MuseURLTestSamples(ContextWithIsUnifiedDelay(context.Background()), server.URL, d, MuseSampleOptions{SetupTimeout: time.Second, Samples: 3})
++	require.NoError(t, err)
++	require.NotEmpty(t, r.Samples)
++	require.LessOrEqual(t, d.dials.Load(), int32(museMaxDials), "at most one new connection for the samples")
++}
++
++func TestMuseURLTestSamplesSetupTimeoutAndRefused(t *testing.T) {
++	server, _ := countingServer(t)
++	d := &rttDialer{addr: server.Listener.Addr().String(), handshake: 2 * time.Second}
++	start := time.Now()
++	_, err := MuseURLTestSamples(context.Background(), server.URL, d, MuseSampleOptions{SetupTimeout: 200 * time.Millisecond, Samples: 3})
++	require.Error(t, err)
++	require.ErrorIs(t, err, context.DeadlineExceeded)
++	require.Less(t, time.Since(start), time.Second, "the setup timeout bounds the test")
++
++	refused := &rttDialer{fail: errors.New("dial tcp 1.2.3.4:443: connect: connection refused")}
++	_, err = MuseURLTestSamples(context.Background(), server.URL, refused, MuseSampleOptions{SetupTimeout: time.Second, Samples: 3})
++	require.ErrorContains(t, err, "connection refused")
++}
+diff --git a/option/monitoring.go b/option/monitoring.go
+index 4ff5cd0bf..23b344111 100644
+--- a/option/monitoring.go
++++ b/option/monitoring.go
+@@ -9,4 +9,7 @@ type MonitoringOptions struct {
+ 	DebounceWindow badoption.Duration `json:"debounce_window,omitempty"`
+ 	URLTestTimeout badoption.Duration `json:"url_test_timeout,omitempty"`
+ 	IdleTimeout    badoption.Duration `json:"idle_timeout,omitempty"`
++	// muse (穿云 1.10.4): node -> node with exactly the same configuration; tested once, the
++	// result is shared
++	MuseSameAs map[string]string `json:"muse_same_as,omitempty"`
+ }

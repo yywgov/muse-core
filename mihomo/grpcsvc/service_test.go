@@ -36,6 +36,11 @@ type fakeEngine struct {
 	reloads  int
 	testGate chan struct{}  // when set, TestDelay waits on it
 	fail     map[string]int // 穿云 1.10.3: TestDelay of a node fails this many times first
+	refuse   map[string]bool          // 穿云 1.10.4: TestDelay of a node is refused at once
+	timeouts map[string][]time.Duration // 穿云 1.10.4: the timeout of each test of a node
+	delay    time.Duration              // 穿云 1.10.4: each test takes this long
+	running  int
+	peak     int
 }
 
 func newFake() *fakeEngine { return &fakeEngine{logs: make(chan LogEvent, 8)} }
@@ -99,9 +104,29 @@ func (f *fakeEngine) TestDelay(ctx context.Context, name, url string, timeout ti
 		<-f.testGate
 	}
 	f.mu.Lock()
+	f.running++
+	if f.running > f.peak {
+		f.peak = f.running
+	}
+	d := f.delay
+	f.mu.Unlock()
+	if d > 0 {
+		time.Sleep(d)
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.running--
+	if f.timeouts == nil {
+		f.timeouts = map[string][]time.Duration{}
+	}
+	f.timeouts[name] = append(f.timeouts[name], timeout)
 	f.tested = append(f.tested, name+"@"+url)
 	n := f.nodes[name]
+	if f.refuse[name] {
+		n.Delay, n.Tested = DelayFailed, time.Unix(1700000000, 0)
+		f.nodes[name] = n
+		return 0, errors.New("dial tcp 203.0.113.9:443: connect: connection refused")
+	}
 	if f.fail[name] > 0 {
 		f.fail[name]--
 		n.Delay, n.Tested = DelayFailed, time.Unix(1700000000, 0)

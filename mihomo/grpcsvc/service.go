@@ -98,6 +98,7 @@ type Service struct {
 	testMu     sync.Mutex
 	testing    map[string]bool
 	retrying   map[string]bool // 穿云 1.10.3: first test failed, re-test pending
+	gate       *testGate       // 穿云 1.10.4: tests at once (adaptive), shared by every 测速
 
 	// GroupsDebounce batches node-list changes (delay results arrive one by one), like the main core.
 	GroupsDebounce time.Duration

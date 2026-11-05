@@ -243,14 +243,20 @@ func (s *Service) UrlTestActive(ctx context.Context, _ *hcommon.Empty) (*hcommon
 	return ok()
 }
 
-// RetestAfter: how long after a batch its failed nodes are tested once more (穿云 1.10.3).
-var RetestAfter = 2 * time.Second
+// RetestAfter: how long after its first try timed out a node is tested once more (穿云 1.10.3: 2 s
+// after the batch; 1.10.4: 1 s after its own test, without waiting for the batch).
+var RetestAfter = 1 * time.Second
 
-// startTests runs delay tests in the background with the configured parallelism; a node already
-// being tested is skipped. Each result marks the node list changed.
-// 穿云 1.10.3: a node whose test fails is tested once more after the batch (fewer connections
-// open then) before its failure is shown: lost probes on a congested home line (China Mobile)
-// showed working nodes as 超时. Until the second test answers, the node shows as not tested yet.
+// startTests runs delay tests in the background; a node already being tested is skipped. Each
+// result marks the node list changed.
+// 穿云 1.10.3: a node whose test fails is tested once more before its failure is shown: lost
+// probes on a congested home line (China Mobile) showed working nodes as 超时. Until the second
+// test answers, the node shows as not tested yet.
+// 穿云 1.10.4 (same as the main core): the first try of a node gets a shorter timeout (5 s of 8);
+// a refused connection / a server name that does not exist is final at once; only a real timeout
+// is tested again, RetestAfter after its own failure with the full timeout (not after the whole
+// batch). How many tests run at once adapts: from the configured count up to 3× (24) while no
+// test times out, back to the configured count when several do.
 func (s *Service) startTests(targets []string) {
 	s.mu.Lock()
 	st := s.settings
@@ -268,57 +274,52 @@ func (s *Service) startTests(targets []string) {
 		return
 	}
 	url, timeout, workers := st.URL(), st.TestTimeout(), st.Workers()
+	gate := s.testGateFor(workers)
 	go func() {
-		failed := s.runTests(todo, workers, url, timeout, true)
-		if len(failed) > 0 {
-			time.Sleep(RetestAfter)
-			s.runTests(failed, workers, url, timeout, false)
+		var wg sync.WaitGroup
+		for _, name := range todo {
+			gate.acquire()
+			wg.Add(1)
+			go func(name string) {
+				defer wg.Done()
+				s.testNode(gate, name, url, timeout)
+			}(name)
 		}
+		wg.Wait()
 	}()
 }
 
-// runTests tests [names] with at most [workers] at once and returns the ones that failed. With
-// [retryLater] a failed node stays marked as being tested (and its failure hidden) for the
-// re-test; otherwise every node is done when its test returns.
-func (s *Service) runTests(names []string, workers int, url string, timeout time.Duration, retryLater bool) []string {
-	if workers > len(names) {
-		workers = len(names)
+// testGateFor returns the shared gate for [workers] (a new one when the setting changed).
+func (s *Service) testGateFor(workers int) *testGate {
+	s.testMu.Lock()
+	defer s.testMu.Unlock()
+	if s.gate == nil || s.gate.base != workers {
+		s.gate = newTestGate(workers)
 	}
-	jobs := make(chan string)
-	var (
-		wg     sync.WaitGroup
-		failMu sync.Mutex
-		failed []string
-	)
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for name := range jobs {
-				_, err := s.eng.TestDelay(context.Background(), name, url, timeout)
-				s.testMu.Lock()
-				if err != nil && retryLater {
-					s.retrying[name] = true
-				} else {
-					delete(s.testing, name)
-					delete(s.retrying, name)
-				}
-				s.testMu.Unlock()
-				if err != nil {
-					failMu.Lock()
-					failed = append(failed, name)
-					failMu.Unlock()
-				}
-				s.nodesHub.publish(true)
-			}
-		}()
+	return s.gate
+}
+
+// testNode runs the first try of [name] (a gate slot already taken) and, when it timed out, the
+// re-test.
+func (s *Service) testNode(gate *testGate, name, url string, timeout time.Duration) {
+	_, err := s.eng.TestDelay(context.Background(), name, url, FirstTryTimeout(timeout))
+	kind := resultKind(err)
+	gate.release(kind)
+	if kind == resultSlow {
+		s.testMu.Lock()
+		s.retrying[name] = true
+		s.testMu.Unlock()
+		s.nodesHub.publish(true)
+		time.Sleep(RetestAfter)
+		gate.acquire()
+		_, err = s.eng.TestDelay(context.Background(), name, url, timeout)
+		gate.release(resultKind(err))
 	}
-	for _, n := range names {
-		jobs <- n
-	}
-	close(jobs)
-	wg.Wait()
-	return failed
+	s.testMu.Lock()
+	delete(s.testing, name)
+	delete(s.retrying, name)
+	s.testMu.Unlock()
+	s.nodesHub.publish(true)
 }
 
 // hideRetrying shows a node whose first test failed and that waits for its re-test as not tested
