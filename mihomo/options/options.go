@@ -8,6 +8,7 @@
 package options
 
 import (
+	"regexp"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -46,6 +47,9 @@ type Settings struct {
 	BypassLAN       bool     `json:"bypass-lan"`
 	TestWorkers     int      `json:"muse-test-workers"`    // 4–64, 0 = 8 (same as the main core, 穿云 1.10.3)
 	TestTimeoutMs   int      `json:"muse-test-timeout-ms"` // 0 = 8000 (穿云 1.10.3)
+	// 穿云 1.12.0: 自动最快 only among nodes whose name matches (one region); empty, invalid or
+	// matching nothing = every node, as before
+	AutoFilter string `json:"muse-auto-filter"`
 	// M3-4: routing like the main core (rules.go): the region ("cn": mainland direct) and the
 	// app's rule list. Kept raw: a list this core cannot read never fails the settings.
 	Region       string          `json:"region"`
@@ -360,7 +364,7 @@ func Build(p *profile.Profile, s Settings, rt Runtime) ([]byte, error) {
 		auto["proxies"] = []any{"REJECT"}
 	} else {
 		if len(names) > 0 {
-			auto["proxies"] = names
+			auto["proxies"] = AutoMembers(names, s.AutoFilter)
 		}
 		if len(providerNames) > 0 {
 			auto["use"] = providerNames
@@ -425,4 +429,26 @@ func sortAny(v []any) {
 			v[j], v[j-1] = v[j-1], v[j]
 		}
 	}
+}
+
+// AutoMembers is the 自动最快 group's members: [names] matching [filter] (穿云 1.12.0), or all of
+// them when the filter is empty, invalid or matches none (never an empty group).
+func AutoMembers(names []any, filter string) []any {
+	if filter == "" {
+		return names
+	}
+	re, err := regexp.Compile(filter)
+	if err != nil {
+		return names
+	}
+	out := make([]any, 0, len(names))
+	for _, n := range names {
+		if s, ok := n.(string); ok && re.MatchString(s) {
+			out = append(out, n)
+		}
+	}
+	if len(out) == 0 {
+		return names
+	}
+	return out
 }

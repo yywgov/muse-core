@@ -78,6 +78,10 @@ func (h *HiddifyInstance) GetProxyInfo(url_test_history *adapter.URLTestHistory,
 		if url_test_history.IsFromCache {
 			out.UrlTestDelay = 0
 		}
+		// 穿云 1.12.0: why the last test failed (empty unless the delay is a failure)
+		if !url_test_history.IsFromCache {
+			out.UrlTestError = url_test_history.MuseReason
+		}
 		if url_test_history.IpInfo != nil {
 			out.Ipinfo = &IpInfo{
 				Ip:          url_test_history.IpInfo.IP,

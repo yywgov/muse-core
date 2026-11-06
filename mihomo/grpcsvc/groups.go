@@ -33,6 +33,7 @@ type NodeInfo struct {
 	Delay     uint16 // 0 untested, DelayFailed failed
 	Tested    time.Time
 	Hidden    bool
+	Reason    string // 穿云 1.12.0: why the last test failed (refused / dns / handshake / timeout)
 }
 
 var errNotStarted = errors.New("service not started")
@@ -71,6 +72,13 @@ func outboundInfo(nodes map[string]NodeInfo, name string) *hcore.OutboundInfo {
 		info.UrlTestDelay = int32(delay)
 		info.UrlTestTime = timestamppb.New(tested)
 	}
+	if delay == DelayFailed {
+		reason := n.Reason
+		if n.Group {
+			reason = nodes[leaf(nodes, name)].Reason
+		}
+		info.UrlTestError = reason
+	}
 	return info
 }
 
@@ -92,6 +100,7 @@ func (s *Service) GroupList(onlyMain bool) *hcore.OutboundGroupList {
 	}
 	nodes := s.eng.Nodes()
 	s.hideRetrying(nodes)
+	s.addReasons(nodes)
 	for _, name := range order {
 		n, ok := nodes[name]
 		if !ok || !n.Group || n.Hidden {
@@ -318,6 +327,11 @@ func (s *Service) testNode(gate *testGate, name, url string, timeout time.Durati
 	s.testMu.Lock()
 	delete(s.testing, name)
 	delete(s.retrying, name)
+	if err != nil {
+		s.reasons[name] = FailReason(err)
+	} else {
+		delete(s.reasons, name)
+	}
 	s.testMu.Unlock()
 	s.nodesHub.publish(true)
 }
@@ -330,6 +344,18 @@ func (s *Service) hideRetrying(nodes map[string]NodeInfo) {
 	for name := range s.retrying {
 		if n, ok := nodes[name]; ok && n.Delay == DelayFailed {
 			n.Delay, n.Tested = 0, time.Time{}
+			nodes[name] = n
+		}
+	}
+}
+
+// addReasons attaches why each failed node's last test failed (穿云 1.12.0).
+func (s *Service) addReasons(nodes map[string]NodeInfo) {
+	s.testMu.Lock()
+	defer s.testMu.Unlock()
+	for name, r := range s.reasons {
+		if n, ok := nodes[name]; ok && n.Delay == DelayFailed {
+			n.Reason = r
 			nodes[name] = n
 		}
 	}

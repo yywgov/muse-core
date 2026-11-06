@@ -40,6 +40,9 @@ type HiddifyOptions struct {
 	// muse (穿云 1.4.0): custom hosts and sites / apps sent through one node (muse_extras.go)
 	MuseHosts     map[string]string `json:"muse-hosts,omitempty"`
 	MuseNodeRules []MuseNodeRule    `json:"muse-node-rules,omitempty"`
+	// muse (穿云 1.12.0): 自动最快 only among nodes whose tag matches this pattern (one region);
+	// empty, invalid or matching nothing = every node, as before
+	MuseAutoFilter string `json:"muse-auto-filter,omitempty"`
 
 	DNSOptions
 	InboundOptions

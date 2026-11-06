@@ -51,7 +51,7 @@ jobs:
           go test -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_grpc ./v2/config/ -run 'Muse|TestSetInbound|RouteRule|DNSGroup' -count=1 -v 2>&1 | tee /tmp/muse-config.log | grep -E '^(=== RUN|--- |PASS|FAIL|ok|panic)|_test.go' 
           test ${PIPESTATUS[0]} -eq 0
           # 穿云 core muse.18: domestic DNS / direct routing (muse_dns_test.go)
-          for t in MuseSameAsIdenticalNodes MuseDirectDNSGroupAddresses MuseRemoteDNSGroupAddresses MuseDomesticDNSIsDirectAndDomestic MuseDomesticTrafficGoesDirect MuseResolveRulePlacement MuseDomesticQUICNotRejected BuildConfigDNSGroups; do
+          for t in MuseSameAsIdenticalNodes MuseDirectDNSGroupAddresses MuseRemoteDNSGroupAddresses MuseDomesticDNSIsDirectAndDomestic MuseDomesticTrafficGoesDirect MuseResolveRulePlacement MuseDomesticQUICNotRejected BuildConfigDNSGroups MuseAutoTagsFilter; do
             grep -q -- "--- PASS: Test$t " /tmp/muse-config.log || { echo "::error::Test$t did not run/pass"; exit 1; }
           done
           go test -ldflags=-checklinkname=0 -tags with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_grpc ./v2/hcore/ -run 'TestSpeedSince' -count=1 -v
@@ -66,7 +66,7 @@ jobs:
           # 穿云 core muse.21: congested home lines - 8 workers, 3 samples, 8 s, one re-test before 超时 (patch 0012)
           # 穿云 core muse.22: one connection per node, timeout tiers, adaptive concurrency, shared results (patch 0013)
           grep -E 'N=(50|100|200) ' /tmp/muse-monitoring.log || true
-          for t in MuseLatencyFirstFailureRetestsOnce MuseRetestDelay MuseTestConcurrencyBudget MuseClampWorkers MuseLatencyThoroughSetsMedian H_BalancerFailoverViaMonitoring MuseSpeedTestSimulation MuseTieredTestEndToEnd MuseSameAsAndFresh MuseManyNodesStayWithinBudget MuseGateAdapts MuseRace MuseLatencyApplyKind MuseURLTestSamplesReuseOneConnection MuseURLTestSamplesNoKeepAlive; do
+          for t in MuseLatencyFirstFailureRetestsOnce MuseRetestDelay MuseTestConcurrencyBudget MuseClampWorkers MuseLatencyThoroughSetsMedian H_BalancerFailoverViaMonitoring MuseSpeedTestSimulation MuseTieredTestEndToEnd MuseSameAsAndFresh MuseManyNodesStayWithinBudget MuseGateAdapts MuseRace MuseLatencyApplyKind MuseURLTestSamplesReuseOneConnection MuseURLTestSamplesNoKeepAlive MuseFailReason MuseReasonOnlyForFailures; do
             grep -q -- "--- PASS: Test$t " /tmp/muse-monitoring.log || { echo "::error::Test$t did not run/pass"; exit 1; }
           done
           # 穿云 core muse.15/16: REALITY key share by fingerprint (chrome PQ, firefox/randomized X25519)

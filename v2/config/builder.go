@@ -251,7 +251,7 @@ func setOutbounds(options *option.Options, input *option.Options, opt *HiddifyOp
 		Type: C.TypeBalancer,
 		Tag:  OutboundURLTestTag,
 		Options: &option.BalancerOutboundOptions{
-			Outbounds:            tags,
+			Outbounds:            museAutoTags(tags, opt.MuseAutoFilter),
 			Strategy:             "lowest-delay",
 			DelayAcceptableRatio: 2,
 			// muse: stay on the current node unless another is clearly faster

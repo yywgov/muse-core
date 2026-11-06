@@ -1,0 +1,144 @@
+From: yywgov <yyw.gov@gmail.com>
+Subject: [PATCH] muse: report why a delay test failed (穿云 1.12.0)
+
+The stored URL test history carries the failure reason (refused / dns / handshake / timeout)
+while its delay is a failure, so the app can explain a dead node. Reporting only: when and how
+nodes are tested, the timeouts and the pick are unchanged.
+---
+diff --git a/adapter/experimental.go b/adapter/experimental.go
+index 22e3cbfb3..9ff5d5954 100644
+--- a/adapter/experimental.go
++++ b/adapter/experimental.go
+@@ -28,6 +28,9 @@ type URLTestHistory struct {
+ 	Delay       uint16         `json:"delay"`
+ 	IpInfo      *ipinfo.IpInfo `json:"ipinfo"`
+ 	IsFromCache bool           `json:"from_cache"`
++	// muse (穿云 1.12.0): why the last test failed — refused / dns / handshake / timeout
++	// ("" = it answered, or the cause is unknown); only set while Delay is a failure
++	MuseReason string `json:"muse_reason,omitempty"`
+ }
+ 
+ type URLTestHistoryStorage interface {
+diff --git a/common/monitoring/muse_reason.go b/common/monitoring/muse_reason.go
+new file mode 100644
+index 000000000..2de451806
+--- /dev/null
++++ b/common/monitoring/muse_reason.go
+@@ -0,0 +1,60 @@
++package monitoring
++
++// 穿云 1.12.0 - why a delay test failed, in four words the app can explain: refused (the port
++// refuses connections), dns (the server name does not resolve), handshake (TLS / REALITY / the
++// proxy protocol broke off after connecting) and timeout (no answer in time). Anything that does
++// not clearly match is reported as timeout, so the list never claims a cause it cannot back.
++// Reporting only: how and when nodes are tested and how the pick is made do not change.
++
++import (
++	"errors"
++	"net"
++	"strings"
++)
++
++const (
++	MuseReasonRefused   = "refused"
++	MuseReasonDNS       = "dns"
++	MuseReasonHandshake = "handshake"
++	MuseReasonTimeout   = "timeout"
++)
++
++// museFailReason classifies a failed test's error.
++func museFailReason(err error) string {
++	if err == nil {
++		return MuseReasonTimeout
++	}
++	var dnsErr *net.DNSError
++	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
++		return MuseReasonDNS
++	}
++	s := strings.ToLower(err.Error())
++	has := func(words ...string) bool {
++		for _, w := range words {
++			if strings.Contains(s, w) {
++				return true
++			}
++		}
++		return false
++	}
++	switch {
++	case has("connection refused", "actively refused"):
++		return MuseReasonRefused
++	case has("no such host", "nxdomain", "server misbehaving", "no address", "lookup "):
++		return MuseReasonDNS
++	case has("timeout", "timed out", "deadline exceeded", "context canceled"):
++		return MuseReasonTimeout
++	case has("tls", "handshake", "reality", "x509", "certificate", "connection reset", "reset by peer",
++		"forcibly closed", "unexpected eof", "eof", "bad response", "malformed", "authentication", "invalid user"):
++		return MuseReasonHandshake
++	}
++	return MuseReasonTimeout
++}
++
++// museReasonFor is the reason stored with a reported delay: empty unless it is a failure.
++func museReasonFor(reported uint16, err error) string {
++	if reported < TimeoutDelay {
++		return ""
++	}
++	return museFailReason(err)
++}
+diff --git a/common/monitoring/muse_reason_test.go b/common/monitoring/muse_reason_test.go
+new file mode 100644
+index 000000000..0f3dbedeb
+--- /dev/null
++++ b/common/monitoring/muse_reason_test.go
+@@ -0,0 +1,29 @@
++package monitoring
++
++import (
++	"errors"
++	"net"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestMuseFailReason(t *testing.T) {
++	require.Equal(t, MuseReasonRefused, museFailReason(errors.New("dial tcp 1.2.3.4:443: connect: connection refused")))
++	require.Equal(t, MuseReasonRefused, museFailReason(errors.New("No connection could be made because the target machine actively refused it.")))
++	require.Equal(t, MuseReasonDNS, museFailReason(&net.DNSError{Err: "no such host", Name: "x.invalid", IsNotFound: true}))
++	require.Equal(t, MuseReasonDNS, museFailReason(errors.New("lookup x.invalid: no such host")))
++	require.Equal(t, MuseReasonHandshake, museFailReason(errors.New("remote error: tls: handshake failure")))
++	require.Equal(t, MuseReasonHandshake, museFailReason(errors.New("reality verification failed")))
++	require.Equal(t, MuseReasonHandshake, museFailReason(errors.New("read: connection reset by peer")))
++	require.Equal(t, MuseReasonTimeout, museFailReason(errors.New("i/o timeout")))
++	require.Equal(t, MuseReasonTimeout, museFailReason(errors.New("context deadline exceeded")))
++	require.Equal(t, MuseReasonTimeout, museFailReason(nil))
++	require.Equal(t, MuseReasonTimeout, museFailReason(errors.New("something odd")), "unknown = timeout, never a guess")
++}
++
++func TestMuseReasonOnlyForFailures(t *testing.T) {
++	require.Equal(t, "", museReasonFor(120, errors.New("connection refused")))
++	require.Equal(t, "", museReasonFor(0, nil), "0 = still testing, no reason yet")
++	require.Equal(t, MuseReasonRefused, museReasonFor(TimeoutDelay, errors.New("connection refused")))
++}
+diff --git a/common/monitoring/outbound_monitoring.go b/common/monitoring/outbound_monitoring.go
+index 8a596a2a9..166f253c1 100644
+--- a/common/monitoring/outbound_monitoring.go
++++ b/common/monitoring/outbound_monitoring.go
+@@ -912,6 +912,9 @@ func (m *OutboundMonitoring) applyResultOne(outcome testOutcome, scheduleRetests
+ 	}
+ 	state.history.Delay = outcome.history.Delay
+ 	state.history.Time = outcome.history.Time
++	// muse (穿云 1.12.0): carry why it failed, for the list; cleared once it answers again.
++	// Only the reported value changes nothing else: the test, its timing and the pick are as before.
++	state.history.MuseReason = museReasonFor(reported, outcome.err)
+ 	state.from_cache = false
+ 	if outcome.history.IpInfo != nil {
+ 		state.history.IpInfo = outcome.history.IpInfo
+@@ -1204,6 +1207,7 @@ func (m *OutboundMonitoring) loadHistory() *History {
+ 			if his.Delay >= TimeoutDelay {
+ 				his.Delay = 0
+ 			}
++			his.MuseReason = ""
+ 			state.mu.Lock()
+ 			state.history = *his
+ 			state.from_cache = true

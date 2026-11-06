@@ -233,3 +233,19 @@ func TestTestDefaults1103(t *testing.T) {
 		t.Errorf("app values not kept: %d %v", s.Workers(), s.TestTimeout())
 	}
 }
+
+func TestMuseAutoMembersFilter(t *testing.T) {
+	names := []any{"🇭🇰 香港 01", "🇯🇵 日本 01", "HK-02"}
+	if got := AutoMembers(names, ""); len(got) != 3 {
+		t.Fatal("empty filter keeps every node")
+	}
+	if got := AutoMembers(names, `香港|HK`); len(got) != 2 {
+		t.Fatalf("got %v", got)
+	}
+	if got := AutoMembers(names, `新加坡`); len(got) != 3 {
+		t.Fatal("no match keeps every node")
+	}
+	if got := AutoMembers(names, `(`); len(got) != 3 {
+		t.Fatal("invalid keeps every node")
+	}
+}
