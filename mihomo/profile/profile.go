@@ -76,7 +76,7 @@ var builtinPolicies = map[string]bool{
 	"DIRECT": true, "REJECT": true, "REJECT-DROP": true, "PASS": true, "COMPATIBLE": true, "GLOBAL": true,
 }
 
-// proxy types mihomo v1.19.33 implements (adapter/parser.go) and this build includes
+// proxy types mihomo v1.19.34 implements (unchanged from v1.19.33; adapter/parser.go) and this build includes
 var supportedTypes = map[string]bool{
 	"ss": true, "ssr": true, "socks5": true, "http": true, "vmess": true, "vless": true, "snell": true,
 	"trojan": true, "hysteria": true, "hysteria2": true, "wireguard": true, "tuic": true,

@@ -1,7 +1,7 @@
 name: Muse mihomo core
 
 # 穿云 v1.7.0 dual core: the mihomo core is its own Go module in mihomo/ (own go.mod, pinned
-# mihomo v1.19.33), so it never shares a binary or go.mod with the sing-box core.
+# mihomo v1.19.34 since 穿云 1.20.5; v1.19.33 before), so it never shares a binary or go.mod with the sing-box core.
 # test: go vet + unit tests (pure Go) + size of a trimmed build per target (job summary).
 # windows: muse-mihomo.dll (c-shared, MinGW) with the same C exports as the main core's DLL.
 # Tag v*-chuanyun* (old: v*-muse*) -> the DLL is attached to the tag's release (muse-mihomo-windows-amd64.tar.gz).
@@ -19,7 +19,7 @@ concurrency:
 
 env:
   MIHOMO_TAGS: with_gvisor,no_tailscale,no_zerotier,no_easytier,no_fake_tcp
-  MIHOMO_VERSION: v1.19.33
+  MIHOMO_VERSION: v1.19.34
 
 jobs:
   test:
