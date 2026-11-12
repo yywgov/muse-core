@@ -4,11 +4,12 @@ name: Muse mihomo core
 # mihomo v1.19.33), so it never shares a binary or go.mod with the sing-box core.
 # test: go vet + unit tests (pure Go) + size of a trimmed build per target (job summary).
 # windows: muse-mihomo.dll (c-shared, MinGW) with the same C exports as the main core's DLL.
-# Tag v*-muse* -> the DLL is attached to the tag's release (muse-mihomo-windows-amd64.tar.gz).
+# Tag v*-chuanyun* (old: v*-muse*) -> the DLL is attached to the tag's release (muse-mihomo-windows-amd64.tar.gz).
 on:
   push:
     branches: [muse, 'rel-*']
-    tags: ['v*-muse*']
+    # 穿云 1.20.4: release tags are v5.0.0-chuanyun.N from chuanyun.25 on (v*-muse* kept for old tags)
+    tags: ['v*-muse*', 'v*-chuanyun*']
     paths: ['mihomo/**', '.github/workflows/mihomo.yml', 'v2/hcore/*.pb.go', 'v2/hcommon/*.pb.go', 'v2/hello/*.pb.go']
   workflow_dispatch:
 
