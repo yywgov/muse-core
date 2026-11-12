@@ -84,13 +84,13 @@ func setDns(options *option.Options, opt *HiddifyOptions, staticIps *map[string]
 	if err != nil {
 		return err
 	}
-	remoteGroup, remoteMembers, err := getDNSGroupOptionsFor(DNSMultiRemoteTag, *remote_dns, museRemoteDNSGroupAddresses(remoteAddr), DNSDirectTag, func(string) string {
+	remoteGroup, remoteMembers, err := getDNSGroupOptionsFor(DNSMultiRemoteTag, museRemoteDNSGroupMode, *remote_dns, museRemoteDNSGroupAddresses(remoteAddr), DNSDirectTag, func(string) string {
 		return OutboundMainDetour
 	})
 	if err != nil {
 		return err
 	}
-	directGroup, directMembers, err := getDNSGroupOptionsFor(DNSMultiDirectTag, *direct_dns, museDirectDNSGroupAddresses(opt.DirectDnsAddress), DNSLocalTag, func(address string) string {
+	directGroup, directMembers, err := getDNSGroupOptionsFor(DNSMultiDirectTag, museDirectDNSGroupMode, *direct_dns, museDirectDNSGroupAddresses(opt.DirectDnsAddress), DNSLocalTag, func(address string) string {
 		if strings.HasPrefix(address, "udp://") {
 			return ""
 		}
@@ -376,12 +376,12 @@ func dnsGroupAddresses(selected string) []string {
 // getDNSGroupOptions builds a sequential DNS group: the already built selected server first,
 // then a member per remaining address of dnsGroupAddresses.
 func getDNSGroupOptions(tag string, selected option.DNSServerOptions, selectedAddress, domainResolver string, detour func(address string) string) (*option.DNSServerOptions, []option.DNSServerOptions, error) {
-	return getDNSGroupOptionsFor(tag, selected, dnsGroupAddresses(selectedAddress), domainResolver, detour)
+	return getDNSGroupOptionsFor(tag, C.DNSGroupModeSequential, selected, dnsGroupAddresses(selectedAddress), domainResolver, detour)
 }
 
-// getDNSGroupOptionsFor builds a sequential DNS group from addresses (addresses[0] is the already
-// built selected server).
-func getDNSGroupOptionsFor(tag string, selected option.DNSServerOptions, addresses []string, domainResolver string, detour func(address string) string) (*option.DNSServerOptions, []option.DNSServerOptions, error) {
+// getDNSGroupOptionsFor builds a DNS group in the given mode (sequential / parallel, standard
+// sing-box group options) from addresses (addresses[0] is the already built selected server).
+func getDNSGroupOptionsFor(tag string, mode string, selected option.DNSServerOptions, addresses []string, domainResolver string, detour func(address string) string) (*option.DNSServerOptions, []option.DNSServerOptions, error) {
 	members := []string{selected.Tag}
 	var servers []option.DNSServerOptions
 	for i, address := range addresses[1:] {
@@ -397,7 +397,7 @@ func getDNSGroupOptionsFor(tag string, selected option.DNSServerOptions, address
 		Type: C.DNSTypeGroup,
 		Options: &option.GroupDNSServerOptions{
 			Servers:      members,
-			Mode:         C.DNSGroupModeSequential,
+			Mode:         mode,
 			IgnoreRanges: []badoption.Prefix{badoption.Prefix(netip.MustParsePrefix(dnsGroupIgnoreRange))},
 		},
 	}, servers, nil

@@ -49,6 +49,33 @@ const (
 // museDirectDNSRewriteTTL is the TTL direct (domestic) answers are given: nil keeps the server's.
 var museDirectDNSRewriteTTL *uint32
 
+// 穿云 1.20.4 (core muse.25): the remote side (DNS through the node, the DNS final) had the two
+// costs the direct side lost in 1.6.4.
+//
+//   - museRemoteDNSGroupMode: the remote group [selected server, tcp fallback] was sequential, and
+//     the group only accepts an answer that still has records, so every empty answer (HTTPS / type
+//     65 records most sites lack, AAAA, NXDOMAIN) asked the second server through the node too:
+//     two round trips on a first lookup. The group now runs in sing-box's standard parallel mode:
+//     both members are asked at once, the first answer with records wins and an empty answer is
+//     used when both are empty — one round trip. The group's acceptance rule itself (an empty
+//     answer is only a fallback, ignore_ranges) is unchanged. Cost: two small DNS messages per
+//     uncached lookup over the node's already open connections. The direct group stays
+//     sequential: its members are all domestic and a few milliseconds apart, and asking them in
+//     order keeps answers on the selected server.
+//   - museRemoteDNSRewriteTTL: remote answers had their TTL rewritten to one day, which apps and
+//     the system resolver (TUN mode) cached too, so after switching nodes they kept connecting to
+//     CDN addresses resolved through the previous node. Remote answers now keep the server's TTL.
+//     No floor: sing-box's rewrite_ttl sets every record to the value (it is not a minimum), and
+//     the optimistic cache already serves an expired answer at once while it refreshes, so short
+//     TTLs add no waiting.
+const (
+	museRemoteDNSGroupMode = C.DNSGroupModeParallel
+	museDirectDNSGroupMode = C.DNSGroupModeSequential
+)
+
+// museRemoteDNSRewriteTTL is the TTL remote answers are given: nil keeps the server's.
+var museRemoteDNSRewriteTTL *uint32
+
 func museDNSClientOptions(opt *HiddifyOptions) option.DNSClientOptions {
 	return option.DNSClientOptions{
 		IndependentCache: opt.IndependentDNSCache && !C.IsIos,

@@ -59,8 +59,10 @@ func TestBuildConfigDNSGroups(t *testing.T) {
 			t.Fatalf("%s: group not found", tag)
 		}
 		g := group.Options.(*option.GroupDNSServerOptions)
-		if g.Mode != C.DNSGroupModeSequential {
-			t.Fatalf("%s: mode %q, want sequential", tag, g.Mode)
+		// 穿云 1.20.4 (muse.25): remote parallel, direct still sequential (muse_dns.go)
+		wantMode := map[string]string{DNSMultiRemoteTag: C.DNSGroupModeParallel, DNSMultiDirectTag: C.DNSGroupModeSequential}[tag]
+		if g.Mode != wantMode {
+			t.Fatalf("%s: mode %q, want %s", tag, g.Mode, wantMode)
 		}
 		if len(g.IgnoreRanges) != 1 || netip.Prefix(g.IgnoreRanges[0]).String() != dnsGroupIgnoreRange {
 			t.Fatalf("%s: ignore ranges %v", tag, g.IgnoreRanges)

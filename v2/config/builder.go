@@ -1053,7 +1053,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 				Server: DNSMultiRemoteTag,
 				AbstractDNSRouteActionOptions: option.AbstractDNSRouteActionOptions{
 					Strategy:       hopt.RemoteDnsDomainStrategy,
-					RewriteTTL:     &DEFAULT_DNS_TTL,
+					RewriteTTL:     museRemoteDNSRewriteTTL,
 					BypassIfFailed: false,
 				},
 			},
